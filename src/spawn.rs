@@ -2,7 +2,8 @@
 //! session on it, so `rvnc xfce4-session` is all a user has to type.
 
 use std::io;
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,18 +44,80 @@ impl Supervisor {
     }
 }
 
-/// Start `Xvfb` on the first free display number and return its name (`:7`).
+/// Directories that hold X servers but are not always on `PATH`, especially
+/// in the trimmed-down containers rvnc tends to run in.
+const EXTRA_BIN_DIRS: [&str; 5] = [
+    "/usr/bin",
+    "/usr/local/bin",
+    "/usr/X11R6/bin",
+    "/usr/libexec",
+    "/opt/X11/bin",
+];
+
+/// Locate an executable, looking beyond `PATH`. An argument containing a
+/// slash is taken as a path and used as is.
+pub fn find_program(name: &str) -> Option<PathBuf> {
+    let executable = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+
+    if name.contains('/') {
+        let path = PathBuf::from(name);
+        return executable(&path).then_some(path);
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(name);
+            if executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    EXTRA_BIN_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|candidate| executable(candidate))
+}
+
+/// rvnc serves an X display; it does not implement one. Creating a display
+/// therefore needs a real X server on the machine.
+fn no_x_server_error(requested: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "{requested} not found.\n\
+             \n\
+             rvnc is a VNC server, not an X server: to create a display it needs Xvfb.\n\
+             Install it with one of:\n\
+             \n    Alpine          apk add xvfb\
+             \n    Debian/Ubuntu   apt install xvfb\
+             \n    Fedora/RHEL     dnf install xorg-x11-server-Xvfb\
+             \n    Arch            pacman -S xorg-server-xvfb\n\
+             \n\
+             Already have an X display running? Serve that one instead and no\n\
+             X server is started:   rvnc --display :0"
+        ),
+    )
+}
+
+/// Start an X server on the first free display number and return its name
+/// (`:7`). `program` must understand Xvfb's command line.
 pub fn start_xvfb(
     sup: &Arc<Supervisor>,
+    program: &str,
     width: u32,
     height: u32,
     depth: u32,
 ) -> io::Result<String> {
+    let binary = find_program(program).ok_or_else(|| no_x_server_error(program))?;
+
     let number = free_display_number()
         .ok_or_else(|| io::Error::new(io::ErrorKind::AddrInUse, "no free X display number"))?;
     let display = format!(":{number}");
 
-    let mut cmd = Command::new("Xvfb");
+    let mut cmd = Command::new(&binary);
     cmd.arg(&display)
         .arg("-screen")
         .arg("0")
@@ -66,16 +129,16 @@ pub fn start_xvfb(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    let child = cmd.spawn().map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("could not start Xvfb ({e}); install it or pass --display to use a running X server"),
-        )
-    })?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| io::Error::new(e.kind(), format!("could not run {}: {e}", binary.display())))?;
     sup.adopt(child);
 
     wait_for_display(number, Duration::from_secs(10))?;
-    log::info(&format!("started Xvfb on {display} ({width}x{height}x{depth})"));
+    log::info(&format!(
+        "started {} on {display} ({width}x{height}x{depth})",
+        binary.display()
+    ));
     Ok(display)
 }
 
@@ -85,7 +148,18 @@ pub fn start_session(
     display: &str,
     argv: &[String],
 ) -> io::Result<()> {
-    let mut cmd = Command::new(&argv[0]);
+    let binary = find_program(&argv[0]).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{} not found. Install the desktop or program you want to run, \
+                 or give rvnc a command that exists.",
+                argv[0]
+            ),
+        )
+    })?;
+
+    let mut cmd = Command::new(&binary);
     cmd.args(&argv[1..])
         .env("DISPLAY", display)
         .stdin(Stdio::null());
@@ -191,6 +265,46 @@ mod tests {
     fn waiting_for_a_dead_display_times_out() {
         let err = wait_for_display(98, Duration::from_millis(120)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn finds_programs_on_path_and_rejects_missing_ones() {
+        assert!(find_program("sh").is_some());
+        assert!(find_program("definitely-not-a-real-binary-9271").is_none());
+    }
+
+    #[test]
+    fn explicit_paths_are_used_as_given() {
+        assert_eq!(find_program("/bin/sh").as_deref(), Some(Path::new("/bin/sh")));
+        assert!(find_program("/bin/definitely-not-here-9271").is_none());
+        // A directory is not a program.
+        assert!(find_program("/usr/bin").is_none());
+    }
+
+    #[test]
+    fn missing_x_server_explains_itself() {
+        let err = no_x_server_error("Xvfb");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let text = err.to_string();
+        assert!(text.contains("not an X server"), "{text}");
+        assert!(text.contains("apk add xvfb"), "{text}");
+        assert!(text.contains("--display"), "{text}");
+    }
+
+    #[test]
+    fn start_xvfb_fails_clearly_when_no_x_server_exists() {
+        let sup = Supervisor::new();
+        let err = start_xvfb(&sup, "not-an-x-server-9271", 800, 600, 24).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("apt install xvfb"));
+    }
+
+    #[test]
+    fn missing_session_command_says_so() {
+        let sup = Supervisor::new();
+        let err = start_session(&sup, ":9", &["no-such-desktop-9271".to_string()]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("not found"));
     }
 
     #[test]

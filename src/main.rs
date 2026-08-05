@@ -24,14 +24,20 @@ rvnc — serve an X display to any browser over VNC
 USAGE:
     rvnc [OPTIONS] [--] [COMMAND [ARGS...]]
 
-    rvnc xfce4-session          start a virtual display, run the desktop, serve it
+    rvnc xfce4-session          start Xvfb, run the desktop on it, serve it
     rvnc --display :1           serve a display that is already running
+
+rvnc serves an X display, it is not an X server itself. Given a command it
+starts Xvfb (which must be installed) and runs the command there; with
+--display it attaches to a display you already have and starts nothing.
 
 OPTIONS:
     -l, --listen ADDR       where to serve, PORT or HOST:PORT [default: 0.0.0.0:6080]
     -d, --display NAME      use an existing X display instead of starting Xvfb
     -g, --geometry WxH      size of the display rvnc starts [default: 1440x900]
         --depth N           colour depth of the display rvnc starts [default: 24]
+        --xserver PROG      X server to start, must take Xvfb's arguments
+                            [default: Xvfb]
     -p, --password PASS     VNC password (max 8 characters, as the protocol allows)
         --password-file F   read the password from a file (first line)
         --no-password       serve with no authentication at all
@@ -49,6 +55,7 @@ struct Args {
     display: Option<String>,
     geometry: (u32, u32),
     depth: u32,
+    xserver: String,
     password: Option<String>,
     no_password: bool,
     view_only: bool,
@@ -64,6 +71,7 @@ impl Default for Args {
             display: None,
             geometry: (1440, 900),
             depth: 24,
+            xserver: "Xvfb".into(),
             password: None,
             no_password: false,
             view_only: false,
@@ -96,17 +104,42 @@ fn run() -> Result<(), Fail> {
     let sup = Supervisor::new();
     spawn::install_signal_handlers(sup.clone());
 
+    // Whatever happens next, do not leave a stray X server behind.
+    let result = serve(&args, &sup);
+    sup.stop();
+    result
+}
+
+fn serve(args: &Args, sup: &Arc<Supervisor>) -> Result<(), Fail> {
+    // Check the session command before starting an X server for it, so a
+    // typo or a missing desktop does not leave a display running.
+    if let Some(program) = args.command.first() {
+        if spawn::find_program(program).is_none() {
+            return Err(format!(
+                "{program} not found. Install the desktop or program you want to run, \
+                 or give rvnc a command that exists."
+            )
+            .into());
+        }
+    }
+
     // Work out which display to serve, starting one if we have to.
     let display = match (&args.display, args.command.is_empty()) {
         (Some(d), _) => d.clone(),
-        (None, false) => spawn::start_xvfb(&sup, args.geometry.0, args.geometry.1, args.depth)?,
+        (None, false) => spawn::start_xvfb(
+            sup,
+            &args.xserver,
+            args.geometry.0,
+            args.geometry.1,
+            args.depth,
+        )?,
         (None, true) => std::env::var("DISPLAY").map_err(|_| {
             "no display to serve: pass --display, set DISPLAY, or give a command to run"
         })?,
     };
 
     if !args.command.is_empty() {
-        spawn::start_session(&sup, &display, &args.command)?;
+        spawn::start_session(sup, &display, &args.command)?;
         spawn::watch_session(sup.clone());
     }
 
@@ -121,7 +154,7 @@ fn run() -> Result<(), Fail> {
         .map_err(|e| format!("cannot set up input injection on {display}: {e}"))?;
 
     let hub = Hub::new(width, height);
-    let password = resolve_password(&args)?;
+    let password = resolve_password(args)?;
 
     let cfg = Arc::new(Config {
         password: password.clone(),
@@ -174,7 +207,6 @@ fn run() -> Result<(), Fail> {
         cfg,
     });
     http::run(listener, server)?;
-    sup.stop();
     Ok(())
 }
 
@@ -249,6 +281,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Option<Args>, Fail>
             "-l" | "--listen" => out.listen = need(args.next(), "--listen")?,
             "-d" | "--display" => out.display = Some(need(args.next(), "--display")?),
             "-g" | "--geometry" => out.geometry = parse_geometry(&need(args.next(), "--geometry")?)?,
+            "--xserver" => out.xserver = need(args.next(), "--xserver")?,
             "--depth" => {
                 let d: u32 = need(args.next(), "--depth")?.parse()?;
                 if !matches!(d, 16 | 24 | 30) {
@@ -342,6 +375,18 @@ mod tests {
         assert_eq!(parse_geometry("800X600").unwrap(), (800, 600));
         assert!(parse_geometry("1920").is_err());
         assert!(parse_geometry("1x1").is_err());
+    }
+
+    #[test]
+    fn xserver_defaults_to_xvfb_and_is_overridable() {
+        assert_eq!(parse(&[]).xserver, "Xvfb");
+        assert_eq!(parse(&["--xserver", "/opt/bin/Xvfb"]).xserver, "/opt/bin/Xvfb");
+    }
+
+    #[test]
+    fn help_does_not_claim_rvnc_is_an_x_server() {
+        assert!(USAGE.contains("it is not an X server itself"));
+        assert!(!USAGE.contains("start a virtual display"));
     }
 
     #[test]

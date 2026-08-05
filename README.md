@@ -8,7 +8,9 @@ um único executável de ~1,3 MB sem nenhuma dependência dinâmica.
 rvnc xfce4-session
 ```
 
-Isso sobe um `Xvfb`, roda a sessão nele e serve tudo em `http://0.0.0.0:6080`.
+Isso sobe um `Xvfb` (que precisa estar instalado, veja
+[Requisitos](#requisitos)), roda a sessão nele e serve tudo em
+`http://0.0.0.0:6080`.
 O link impresso no startup já leva direto para a área de trabalho — não existe
 tela de conexão intermediária.
 
@@ -23,6 +25,34 @@ rvnc:   or http://localhost:6080/ and enter: Kf3xpQ7m
 Nada de protocolo inventado: o servidor fala **RFB 3.8** (o protocolo VNC de
 verdade) e o cliente é o **noVNC oficial**, embutido no binário em tempo de
 compilação.
+
+## Requisitos
+
+O `rvnc` serve um display X — ele **não é um servidor X**. São coisas
+diferentes: o servidor X é quem cria o display e desenha; o `rvnc` é quem
+captura esse display e entrega para o navegador.
+
+Então, para **criar** um display, é preciso ter um `Xvfb` na máquina:
+
+| Distro | Comando |
+| --- | --- |
+| Alpine | `apk add xvfb` |
+| Debian/Ubuntu | `apt install xvfb` |
+| Fedora/RHEL | `dnf install xorg-x11-server-Xvfb` |
+| Arch | `pacman -S xorg-server-xvfb` |
+
+Para **servir um display que já existe** (`--display :0`), nada disso é
+necessário — o `rvnc` sozinho basta.
+
+O binário em si continua sem dependência dinâmica nenhuma: o `Xvfb` é um
+processo separado que o `rvnc` inicia, não uma biblioteca com a qual ele liga.
+
+Exemplo completo do zero, no Alpine:
+
+```sh
+apk add xvfb xfce4 xfce4-terminal
+./rvnc -l 0.0.0.0:8080 xfce4-session
+```
 
 ## Uso
 
@@ -39,6 +69,7 @@ rvnc --listen 127.0.0.1:6080 --view-only --display :0
 | `-d, --display NOME` | usa um X existente em vez de subir um `Xvfb` |
 | `-g, --geometry WxH` | tamanho do display criado (padrão `1440x900`) |
 | `--depth N` | profundidade de cor do display criado (`16`, `24`, `30`) |
+| `--xserver PROG` | qual servidor X iniciar, com a sintaxe do `Xvfb` (padrão `Xvfb`) |
 | `-p, --password SENHA` | senha VNC (o protocolo usa no máximo 8 caracteres) |
 | `--password-file ARQ` | lê a senha da primeira linha do arquivo |
 | `--no-password` | serve sem autenticação nenhuma |
@@ -69,8 +100,8 @@ Alvos usados nos releases: `x86_64-unknown-linux-musl` (amd64),
 `aarch64-unknown-linux-musl` (arm64) e `armv7-unknown-linux-musleabihf`
 (armhf).
 
-Em tempo de execução, o `Xvfb` só é necessário quando o `rvnc` precisa criar o
-display; com `--display` ele não é usado.
+Em tempo de execução, veja [Requisitos](#requisitos): o `Xvfb` só é necessário
+quando o `rvnc` precisa criar o display.
 
 ## Releases
 
@@ -123,7 +154,7 @@ Cinco peças, todas dentro do mesmo processo:
 ## Testes
 
 ```sh
-cargo test                 # 42 testes de unidade
+cargo test                 # 49 testes de unidade
 ```
 
 Para o teste ponta a ponta existe um cliente X de apoio que pinta quadrantes
