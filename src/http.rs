@@ -20,6 +20,7 @@ pub struct Server {
     pub hub: Arc<Hub>,
     pub input: Arc<Mutex<Input>>,
     pub cfg: Arc<Config>,
+    pub extras: rfb::Extras,
 }
 
 pub fn run(listener: TcpListener, server: Arc<Server>) -> io::Result<()> {
@@ -115,18 +116,37 @@ fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
 
 /// Reject cross-origin upgrades: without this, any web page the user visits
 /// could open a socket to a passwordless server on their own machine.
-fn origin_allowed(req: &Request) -> bool {
+///
+/// Behind a reverse proxy the browser's `Origin` names the public host while
+/// `Host` may name the backend, so `X-Forwarded-Host` counts too. A browser
+/// cannot set that header on a WebSocket handshake, only a proxy can, so
+/// honouring it does not weaken the check against drive-by pages.
+fn origin_allowed(req: &Request, allowed: &[String]) -> bool {
     let Some(origin) = req.header("origin") else {
         return true; // native clients and curl send no Origin
     };
-    let Some(host) = req.header("host") else {
-        return false;
-    };
-    let origin_host = origin
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(origin);
-    origin_host == host || origin_host.split(':').next() == host.split(':').next()
+    let origin_host = host_of(origin.split_once("://").map_or(origin, |(_, rest)| rest));
+
+    if allowed.iter().any(|a| host_of(a) == origin_host) {
+        return true;
+    }
+    [req.header("host"), req.header("x-forwarded-host")]
+        .into_iter()
+        .flatten()
+        // A proxy chain can leave a list here; the first entry is the client's.
+        .flat_map(|value| value.split(','))
+        .any(|candidate| host_of(candidate.trim()) == origin_host)
+}
+
+/// Strip the port from a `host:port` pair, leaving IPv6 literals intact.
+fn host_of(value: &str) -> &str {
+    if value.starts_with('[') {
+        return match value.find(']') {
+            Some(end) => &value[..=end],
+            None => value,
+        };
+    }
+    value.split(':').next().unwrap_or(value)
 }
 
 fn upgrade_websocket(
@@ -135,8 +155,12 @@ fn upgrade_websocket(
     req: Request,
     server: &Server,
 ) -> io::Result<()> {
-    if !origin_allowed(&req) {
-        log::warn(&format!("rejected cross-origin websocket from {:?}", req.header("origin")));
+    if !origin_allowed(&req, &server.cfg.allowed_origins) {
+        log::warn(&format!(
+            "rejected websocket with Origin {:?} (Host {:?}); pass --allow-origin HOST if this is your proxy",
+            req.header("origin"),
+            req.header("host"),
+        ));
         return respond(stream, 403, "text/plain", b"cross-origin websocket rejected");
     }
     let Some(key) = req.header("sec-websocket-key") else {
@@ -171,6 +195,7 @@ fn upgrade_websocket(
         server.hub.clone(),
         server.input.clone(),
         server.cfg.clone(),
+        server.extras.clone(),
     );
     log::info("client disconnected");
     let _ = sink.lock().unwrap().close();
@@ -269,13 +294,51 @@ mod tests {
 
     #[test]
     fn same_origin_allowed_cross_origin_rejected() {
+        let none: &[String] = &[];
         assert!(origin_allowed(&parse(
             "GET / HTTP/1.1\r\nHost: box:6080\r\nOrigin: http://box:6080\r\n\r\n"
-        )));
-        assert!(origin_allowed(&parse("GET / HTTP/1.1\r\nHost: box:6080\r\n\r\n")));
+        ), none));
+        assert!(origin_allowed(&parse("GET / HTTP/1.1\r\nHost: box:6080\r\n\r\n"), none));
         assert!(!origin_allowed(&parse(
             "GET / HTTP/1.1\r\nHost: box:6080\r\nOrigin: http://evil.example\r\n\r\n"
-        )));
+        ), none));
+    }
+
+    #[test]
+    fn reverse_proxy_origins_are_accepted() {
+        let none: &[String] = &[];
+        // Caddy keeps the public Host: straightforward match.
+        assert!(origin_allowed(&parse(
+            "GET / HTTP/1.1\r\nHost: br.example.com\r\nOrigin: https://br.example.com\r\n\r\n"
+        ), none));
+        // A proxy that rewrites Host to the backend still forwards the real one.
+        assert!(origin_allowed(&parse(
+            "GET / HTTP/1.1\r\nHost: 10.0.3.138:8080\r\n\
+             X-Forwarded-Host: br.example.com\r\nOrigin: https://br.example.com\r\n\r\n"
+        ), none));
+        // Neither header matches: still refused.
+        assert!(!origin_allowed(&parse(
+            "GET / HTTP/1.1\r\nHost: 10.0.3.138:8080\r\n\
+             X-Forwarded-Host: br.example.com\r\nOrigin: https://evil.example\r\n\r\n"
+        ), none));
+    }
+
+    #[test]
+    fn allow_origin_overrides_the_check() {
+        let allowed = vec!["br.example.com".to_string()];
+        assert!(origin_allowed(&parse(
+            "GET / HTTP/1.1\r\nHost: 10.0.3.138:8080\r\nOrigin: https://br.example.com\r\n\r\n"
+        ), &allowed));
+        assert!(!origin_allowed(&parse(
+            "GET / HTTP/1.1\r\nHost: 10.0.3.138:8080\r\nOrigin: https://other.example\r\n\r\n"
+        ), &allowed));
+    }
+
+    #[test]
+    fn ipv6_literals_keep_their_address() {
+        assert_eq!(host_of("[fc42::1]:8080"), "[fc42::1]");
+        assert_eq!(host_of("box:6080"), "box");
+        assert_eq!(host_of("box"), "box");
     }
 
     #[test]

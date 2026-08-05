@@ -26,6 +26,16 @@
   input { background: #1d2026; color: inherit; border: 1px solid #3a4150; border-radius: 6px;
           padding: .5rem .6rem; font: inherit; }
   #error { color: #ff8f8f; min-height: 1.2em; }
+  #clipboard { position: fixed; inset: 0; display: none; place-items: center;
+               background: #05070ac9; z-index: 15; }
+  #clipboard > div { display: grid; gap: .6rem; width: min(34rem, 92vw);
+                     background: #1d2026; border: 1px solid #3a4150;
+                     border-radius: 10px; padding: 1rem; }
+  #clipboard h1 { margin: 0; font-size: 1rem; }
+  #clipboard p { margin: 0; color: #9aa3b2; font-size: .85rem; }
+  textarea { background: #14161a; color: inherit; border: 1px solid #3a4150;
+             border-radius: 6px; padding: .5rem; font: 13px/1.5 ui-monospace, monospace;
+             resize: vertical; }
 </style>
 </head>
 <body>
@@ -34,10 +44,20 @@
   <strong>rvnc</strong>
   <span id="status">connecting…</span>
   <button id="cad" title="Send Ctrl+Alt+Delete">Ctrl+Alt+Del</button>
-  <button id="fit" title="Toggle scaling to fit the window">Fit: on</button>
+  <button id="mode" title="Resize the desktop to the window, or scale it to fit">Mode: resize</button>
+  <button id="clip" title="Clipboard">Clipboard</button>
   <button id="full" title="Fullscreen">Fullscreen</button>
 </div>
 <div id="screen"></div>
+
+<div id="clipboard">
+  <div>
+    <h1>Clipboard</h1>
+    <p>Shared with the desktop. Editing this sends it across.</p>
+    <textarea id="cliptext" rows="8" spellcheck="false"></textarea>
+    <button id="clipclose">Close</button>
+  </div>
+</div>
 
 <div id="login">
   <form id="loginform">
@@ -58,11 +78,17 @@ const el = (id) => document.getElementById(id);
 const status = el('status');
 const bar = el('bar');
 let rfb = null;
-let scaling = params.get('scale') !== 'off';
+// "resize" makes the desktop adopt the window size, so fullscreen gives the
+// real screen resolution instead of a scaled-up smaller one.
+let mode = params.get('mode') === 'scale' ? 'scale' : 'resize';
+let lastClipboard = '';
 
 function url() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${proto}://${location.host}/websockify`;
+  // Relative to the directory this page was served from, so rvnc works
+  // behind a reverse proxy that mounts it on a subpath such as /vnc/.
+  const base = location.pathname.replace(/[^/]*$/, '');
+  return `${proto}://${location.host}${base}websockify`;
 }
 
 function say(text, sticky) {
@@ -76,9 +102,17 @@ function connect(password) {
   say('connecting…', true);
 
   rfb = new RFB(el('screen'), url(), { credentials: password ? { password } : {} });
-  rfb.scaleViewport = scaling;
-  rfb.resizeSession = false;
+  applyMode();
   rfb.showDotCursor = true;
+
+  // Desktop -> browser.
+  rfb.addEventListener('clipboard', (e) => {
+    lastClipboard = e.detail.text;
+    el('cliptext').value = lastClipboard;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(lastClipboard).catch(() => {});
+    }
+  });
 
   rfb.addEventListener('connect', () => {
     say('connected');
@@ -121,10 +155,48 @@ el('loginform').addEventListener('submit', (e) => {
 
 el('cad').addEventListener('click', () => rfb && rfb.sendCtrlAltDel());
 
-el('fit').addEventListener('click', () => {
-  scaling = !scaling;
-  el('fit').textContent = `Fit: ${scaling ? 'on' : 'off'}`;
-  if (rfb) rfb.scaleViewport = scaling;
+function applyMode() {
+  if (!rfb) return;
+  rfb.scaleViewport = mode === 'scale';
+  rfb.resizeSession = mode === 'resize';
+}
+
+el('mode').addEventListener('click', () => {
+  mode = mode === 'resize' ? 'scale' : 'resize';
+  el('mode').textContent = `Mode: ${mode}`;
+  applyMode();
+});
+
+// Browser -> desktop.
+function sendClipboard(text) {
+  if (!rfb || text === lastClipboard) return;
+  lastClipboard = text;
+  rfb.clipboardPasteFrom(text);
+}
+
+el('clip').addEventListener('click', () => {
+  el('clipboard').style.display = 'grid';
+  el('cliptext').focus();
+});
+el('clipclose').addEventListener('click', () => {
+  el('clipboard').style.display = 'none';
+});
+el('cliptext').addEventListener('input', (e) => sendClipboard(e.target.value));
+
+// Whenever the page regains focus, pick up whatever was copied outside it.
+// Needs a secure context (https or localhost) and the user's permission; the
+// Clipboard panel above is the fallback when that is refused.
+async function pullBrowserClipboard() {
+  if (!navigator.clipboard || !navigator.clipboard.readText) return;
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) sendClipboard(text);
+  } catch (_) { /* not permitted, use the panel */ }
+}
+window.addEventListener('focus', pullBrowserClipboard);
+document.addEventListener('paste', (e) => {
+  const text = e.clipboardData && e.clipboardData.getData('text');
+  if (text) sendClipboard(text);
 });
 
 el('full').addEventListener('click', () => {

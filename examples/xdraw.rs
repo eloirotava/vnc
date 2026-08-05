@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    self, ChangeGCAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, WindowClass,
+    self, Atom, AtomEnum, ChangeGCAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
+    PropMode, SelectionNotifyEvent, WindowClass, SELECTION_NOTIFY_EVENT,
 };
 use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as _;
@@ -31,6 +32,22 @@ struct App {
     gc: xproto::Gcontext,
     w: u16,
     h: u16,
+}
+
+impl App {
+    /// Paint the four quadrants over the whole current screen.
+    fn repaint(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let (hw, hh) = (self.w / 2, self.h / 2);
+        for (i, colour) in QUADRANTS.iter().enumerate() {
+            let (x, y) = ((i as i16 % 2) * hw as i16, (i as i16 / 2) * hh as i16);
+            // The right and bottom halves take any odd pixel.
+            let width = if i % 2 == 0 { hw } else { self.w - hw };
+            let height = if i / 2 == 0 { hh } else { self.h - hh };
+            self.fill(x, y, width, height, *colour)?;
+        }
+        self.conn.sync()?;
+        Ok(())
+    }
 }
 
 impl App {
@@ -65,7 +82,7 @@ impl App {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(None)?;
-    let screen = &conn.setup().roots[screen_num];
+    let screen = conn.setup().roots[screen_num].clone();
     let (w, h) = (screen.width_in_pixels, screen.height_in_pixels);
     let (min_keycode, max_keycode) = (conn.setup().min_keycode, conn.setup().max_keycode);
 
@@ -88,31 +105,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     conn.map_window(win)?;
     conn.set_input_focus(xproto::InputFocus::PARENT, win, x11rb::CURRENT_TIME)?;
+    // Watch for the screen changing size under us.
+    conn.change_window_attributes(
+        screen.root,
+        &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+    )?;
+
+    let atom = |name: &str| -> Result<Atom, Box<dyn std::error::Error>> {
+        Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
+    };
+    let clipboard_atom = atom("CLIPBOARD")?;
+    let utf8_atom = atom("UTF8_STRING")?;
+    let prop_atom = atom("XDRAW_SEL")?;
+    let targets_atom = atom("TARGETS")?;
+    let mut owned_text = String::from("hello-from-the-desktop");
 
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win, &CreateGCAux::new())?;
-    let app = App { conn, win, gc, w, h };
-
-    let (hw, hh) = (w / 2, h / 2);
-    for (i, colour) in QUADRANTS.iter().enumerate() {
-        let (x, y) = ((i as i16 % 2) * hw as i16, (i as i16 / 2) * hh as i16);
-        app.fill(x, y, hw, hh, *colour)?;
-    }
-    app.conn.sync()?;
+    let mut app = App { conn, win, gc, w, h };
+    app.repaint()?;
     eprintln!("xdraw: painted {w}x{h}");
+
+    // Offer something on the clipboard so the browser side can be checked.
+    app.conn
+        .set_selection_owner(win, clipboard_atom, x11rb::CURRENT_TIME)?;
+    app.conn.flush()?;
+    let mut we_own_clipboard = true;
+    let mut last_seen = String::new();
+    let mut poll_countdown = 0;
 
     let keymap = app
         .conn
         .get_keyboard_mapping(min_keycode, max_keycode - min_keycode + 1)?
         .reply()?;
 
-    let y = (h / 2) as i16 - SQUARE as i16 / 2;
     let mut step = 0i16;
     let mut previous: Option<i16> = None;
 
     loop {
+        let y = (app.h / 2) as i16 - SQUARE as i16 / 2;
         while let Some(event) = app.conn.poll_for_event()? {
             match event {
+                Event::ConfigureNotify(e) if e.window == screen.root => {
+                    if (e.width, e.height) != (app.w, app.h) {
+                        eprintln!("xdraw: screen resized to {}x{}", e.width, e.height);
+                        app.w = e.width;
+                        app.h = e.height;
+                        app.conn.configure_window(
+                            win,
+                            &xproto::ConfigureWindowAux::new()
+                                .width(e.width as u32)
+                                .height(e.height as u32),
+                        )?;
+                        app.repaint()?;
+                        previous = None;
+                        step = 0;
+                    }
+                }
+                Event::SelectionClear(_) => {
+                    we_own_clipboard = false;
+                    eprintln!("xdraw: lost the clipboard");
+                }
+                Event::SelectionRequest(e) => {
+                    let mut property = e.property;
+                    if e.target == targets_atom {
+                        app.conn.change_property32(
+                            PropMode::REPLACE,
+                            e.requestor,
+                            property,
+                            AtomEnum::ATOM,
+                            &[targets_atom, utf8_atom, Atom::from(AtomEnum::STRING)],
+                        )?;
+                    } else if e.target == utf8_atom || e.target == Atom::from(AtomEnum::STRING) {
+                        app.conn.change_property8(
+                            PropMode::REPLACE,
+                            e.requestor,
+                            property,
+                            e.target,
+                            owned_text.as_bytes(),
+                        )?;
+                    } else {
+                        property = x11rb::NONE;
+                    }
+                    app.conn.send_event(
+                        false,
+                        e.requestor,
+                        EventMask::NO_EVENT,
+                        SelectionNotifyEvent {
+                            response_type: SELECTION_NOTIFY_EVENT,
+                            sequence: 0,
+                            time: e.time,
+                            requestor: e.requestor,
+                            selection: e.selection,
+                            target: e.target,
+                            property,
+                        },
+                    )?;
+                    app.conn.flush()?;
+                    eprintln!("xdraw: served the clipboard to another client");
+                }
+                Event::SelectionNotify(e) => {
+                    if e.property != x11rb::NONE {
+                        let r = app
+                            .conn
+                            .get_property(true, win, prop_atom, AtomEnum::ANY, 0, 4096)?
+                            .reply()?;
+                        let text = String::from_utf8_lossy(&r.value).into_owned();
+                        if !text.is_empty() && text != last_seen {
+                            last_seen = text.clone();
+                            eprintln!("xdraw: clipboard now holds {text:?}");
+                        }
+                    }
+                }
                 Event::ButtonPress(e) => {
                     eprintln!("xdraw: button {} at {},{}", e.detail, e.event_x, e.event_y);
                     app.fill(0, 0, MARKER, MARKER, BUTTON_MARKER)?;
@@ -128,6 +232,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Once something else owns the clipboard, keep an eye on it.
+        if !we_own_clipboard {
+            poll_countdown -= 1;
+            if poll_countdown <= 0 {
+                poll_countdown = 5;
+                app.conn.convert_selection(
+                    win,
+                    clipboard_atom,
+                    utf8_atom,
+                    prop_atom,
+                    x11rb::CURRENT_TIME,
+                )?;
+            }
+        }
+        let _ = &mut owned_text;
+
         if let Some(old) = previous {
             app.restore(old, y, SQUARE, SQUARE)?;
         }
@@ -135,7 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         previous = Some(step);
         app.conn.flush()?;
 
-        step = (step + 8) % (w as i16 - SQUARE as i16);
+        step = (step + 8) % (app.w as i16 - SQUARE as i16).max(1);
         std::thread::sleep(Duration::from_millis(100));
     }
 }
