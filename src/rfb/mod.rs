@@ -20,12 +20,14 @@ const MSG_FB_UPDATE_REQUEST: u8 = 3;
 const MSG_KEY_EVENT: u8 = 4;
 const MSG_POINTER_EVENT: u8 = 5;
 const MSG_CLIENT_CUT_TEXT: u8 = 6;
+const MSG_SET_DESKTOP_SIZE: u8 = 251;
 
 const ENC_RAW: i32 = 0;
 const ENC_ZRLE: i32 = 16;
 const ENC_CURSOR: i32 = -239;
 const ENC_LAST_RECT: i32 = -224;
 const ENC_DESKTOP_SIZE: i32 = -223;
+const ENC_EXT_DESKTOP_SIZE: i32 = -308;
 
 /// Guards against a client asking us to allocate unbounded memory.
 const MAX_ENCODINGS: u16 = 4096;
@@ -35,6 +37,17 @@ pub struct Config {
     pub password: Option<String>,
     pub view_only: bool,
     pub desktop_name: String,
+    /// Extra hostnames accepted in a WebSocket `Origin` header, for proxies
+    /// that rewrite both `Host` and `X-Forwarded-Host`.
+    pub allowed_origins: Vec<String>,
+}
+
+/// The optional pieces a session can use, absent when the display does not
+/// support them.
+#[derive(Clone, Default)]
+pub struct Extras {
+    pub resizer: Option<Arc<crate::x11::Resizer>>,
+    pub clipboard: Option<Arc<crate::clipboard::Clipboard>>,
 }
 
 /// Run a full session. `reader` and `writer` are the two halves of one
@@ -46,6 +59,7 @@ pub fn serve<R: Read + Send + 'static, W: Write + Send + 'static>(
     hub: Arc<Hub>,
     input: Arc<Mutex<Input>>,
     cfg: Arc<Config>,
+    extras: Extras,
 ) -> io::Result<()> {
     let minor = handshake_version(&mut reader, &writer)?;
     authenticate(&mut reader, &writer, minor, &cfg)?;
@@ -69,8 +83,9 @@ pub fn serve<R: Read + Send + 'static, W: Write + Send + 'static>(
         let hub_r = hub.clone();
         let cfg_r = cfg.clone();
         let input_r = input.clone();
+        let extras_r = extras.clone();
         let reader_thread = std::thread::spawn(move || {
-            let r = read_loop(reader, &link_r, &hub_r, &input_r, &cfg_r);
+            let r = read_loop(reader, &link_r, &hub_r, &input_r, &cfg_r, &extras_r);
             link_r.close();
             r
         });
@@ -171,6 +186,7 @@ fn read_loop<R: Read>(
     hub: &Arc<Hub>,
     input: &Arc<Mutex<Input>>,
     cfg: &Config,
+    extras: &Extras,
 ) -> io::Result<()> {
     let mut type_ = [0u8; 1];
     loop {
@@ -207,10 +223,16 @@ fn read_loop<R: Read>(
                         ENC_CURSOR => caps.cursor = true,
                         ENC_LAST_RECT => caps.last_rect = true,
                         ENC_DESKTOP_SIZE => caps.desktop_size = true,
+                        ENC_EXT_DESKTOP_SIZE => caps.ext_desktop_size = true,
                         _ => {}
                     }
                 }
                 let mut st = link.state.lock().unwrap();
+                // Announcing the current size tells the client that resizing
+                // is available at all.
+                if caps.ext_desktop_size && st.pending_resize.is_none() {
+                    st.pending_resize = Some(0);
+                }
                 st.caps = caps;
                 st.cursor_dirty = true;
                 drop(st);
@@ -260,8 +282,32 @@ fn read_loop<R: Read>(
                         "oversized clipboard message",
                     ));
                 }
-                // Clipboard integration is not implemented yet; drain it.
-                io::copy(&mut reader.by_ref().take(len as u64), &mut io::sink())?;
+                let mut text = vec![0u8; len as usize];
+                reader.read_exact(&mut text)?;
+                if !cfg.view_only {
+                    if let Some(clipboard) = &extras.clipboard {
+                        let decoded = crate::clipboard::from_latin1(&text);
+                        if let Err(e) = clipboard.set(decoded) {
+                            crate::http::log::debug(&format!("clipboard: {e}"));
+                        }
+                    }
+                    // Keep other viewers in step; taking ownership ourselves
+                    // produces no XFIXES notification we would see.
+                    hub.broadcast_clipboard(Arc::new(text), Some(link));
+                }
+            }
+            MSG_SET_DESKTOP_SIZE => {
+                let mut head = [0u8; 7];
+                reader.read_exact(&mut head)?;
+                let width = u16::from_be_bytes([head[1], head[2]]);
+                let height = u16::from_be_bytes([head[3], head[4]]);
+                let screens = head[5];
+                // Screen array: 16 bytes each, we lay everything out ourselves.
+                let mut screen = [0u8; 16];
+                for _ in 0..screens {
+                    reader.read_exact(&mut screen)?;
+                }
+                apply_resize(link, hub, extras, cfg, width, height);
             }
             other => {
                 return Err(io::Error::new(
@@ -269,6 +315,43 @@ fn read_loop<R: Read>(
                     format!("unknown client message type {other}"),
                 ));
             }
+        }
+    }
+}
+
+/// Honour a client's resize request, if the display can do it at all.
+fn apply_resize(
+    link: &Arc<ClientLink>,
+    hub: &Arc<Hub>,
+    extras: &Extras,
+    cfg: &Config,
+    width: u16,
+    height: u16,
+) {
+    if cfg.view_only || width == 0 || height == 0 {
+        return;
+    }
+    let Some(resizer) = &extras.resizer else {
+        // No RandR: acknowledge with the size we still have, so the client
+        // stops waiting and falls back to scaling.
+        let mut st = link.state.lock().unwrap();
+        st.pending_resize = Some(1);
+        drop(st);
+        link.wake();
+        return;
+    };
+
+    match resizer.resize(width, height) {
+        Ok((w, h)) => {
+            crate::http::log::debug(&format!("resize to {width}x{height} -> {w}x{h}"));
+            hub.resize(w as u32, h as u32, Some(link));
+        }
+        Err(e) => {
+            crate::http::log::warn(&format!("resize to {width}x{height} failed: {e}"));
+            let mut st = link.state.lock().unwrap();
+            st.pending_resize = Some(1);
+            drop(st);
+            link.wake();
         }
     }
 }
@@ -283,11 +366,14 @@ fn write_loop<W: Write>(
     let mut msg = Vec::new();
 
     loop {
-        let (pf, caps, rects, send_cursor) = {
+        let (pf, caps, rects, send_cursor, resize, clipboard) = {
             let mut st = link.state.lock().unwrap();
             loop {
                 if st.closed {
                     return Ok(());
+                }
+                if st.clipboard.is_some() || st.pending_resize.is_some() {
+                    break;
                 }
                 let has_work = st.want_full || !st.dirty.is_empty() || st.cursor_dirty;
                 if st.want_update && has_work {
@@ -307,21 +393,38 @@ fn write_loop<W: Write>(
                 st.dirty.take_rects(w, h)
             };
             let send_cursor = st.cursor_dirty && st.caps.cursor;
+            let resize = st.pending_resize.take().filter(|_| st.caps.ext_desktop_size);
+            let clipboard = st.clipboard.take();
             st.cursor_dirty = false;
             st.want_update = false;
             st.want_full = false;
-            (st.pf, st.caps, rects, send_cursor)
+            (st.pf, st.caps, rects, send_cursor, resize, clipboard)
         };
 
         if codec.format() != pf {
             codec = PixCodec::new(pf);
         }
 
+        // Clipboard is its own message type, not part of an update.
+        if let Some(text) = clipboard {
+            let mut cut = Vec::with_capacity(8 + text.len());
+            cut.push(3); // ServerCutText
+            cut.extend_from_slice(&[0, 0, 0]);
+            cut.extend_from_slice(&(text.len() as u32).to_be_bytes());
+            cut.extend_from_slice(&text);
+            send(writer, &cut)?;
+        }
+
+        let (fb_width, fb_height) = hub.dimensions();
         msg.clear();
-        let count = rects.len() + send_cursor as usize;
+        let count = rects.len() + send_cursor as usize + resize.is_some() as usize;
         msg.push(0); // FramebufferUpdate
         msg.push(0);
         msg.extend_from_slice(&(count as u16).to_be_bytes());
+
+        if let Some(reason) = resize {
+            write_ext_desktop_size(&mut msg, reason, fb_width as u16, fb_height as u16);
+        }
 
         if send_cursor {
             write_cursor(&mut msg, hub, &codec);
@@ -350,6 +453,25 @@ fn write_loop<W: Write>(
             "update: {} rect(s), {} bytes", count, msg.len()));
         send(writer, &msg)?;
     }
+}
+
+/// ExtendedDesktopSize rectangle: tells the client the current size and, by
+/// its mere presence, that this server accepts resize requests.
+fn write_ext_desktop_size(msg: &mut Vec<u8>, reason: u16, width: u16, height: u16) {
+    msg.extend_from_slice(&reason.to_be_bytes()); // x carries the reason
+    msg.extend_from_slice(&0u16.to_be_bytes()); // y carries the status: 0 = ok
+    msg.extend_from_slice(&width.to_be_bytes());
+    msg.extend_from_slice(&height.to_be_bytes());
+    msg.extend_from_slice(&ENC_EXT_DESKTOP_SIZE.to_be_bytes());
+
+    msg.push(1); // one screen
+    msg.extend_from_slice(&[0, 0, 0]); // padding
+    msg.extend_from_slice(&1u32.to_be_bytes()); // screen id
+    msg.extend_from_slice(&0u16.to_be_bytes()); // x
+    msg.extend_from_slice(&0u16.to_be_bytes()); // y
+    msg.extend_from_slice(&width.to_be_bytes());
+    msg.extend_from_slice(&height.to_be_bytes());
+    msg.extend_from_slice(&0u32.to_be_bytes()); // flags
 }
 
 /// Cursor pseudo-encoding: the client draws the pointer locally, so it stays

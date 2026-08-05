@@ -8,7 +8,9 @@ um único executável de ~1,3 MB sem nenhuma dependência dinâmica.
 rvnc xfce4-session
 ```
 
-Isso sobe um `Xvfb`, roda a sessão nele e serve tudo em `http://0.0.0.0:6080`.
+Isso sobe um `Xvfb` (que precisa estar instalado, veja
+[Requisitos](#requisitos)), roda a sessão nele e serve tudo em
+`http://0.0.0.0:6080`.
 O link impresso no startup já leva direto para a área de trabalho — não existe
 tela de conexão intermediária.
 
@@ -23,6 +25,34 @@ rvnc:   or http://localhost:6080/ and enter: Kf3xpQ7m
 Nada de protocolo inventado: o servidor fala **RFB 3.8** (o protocolo VNC de
 verdade) e o cliente é o **noVNC oficial**, embutido no binário em tempo de
 compilação.
+
+## Requisitos
+
+O `rvnc` serve um display X — ele **não é um servidor X**. São coisas
+diferentes: o servidor X é quem cria o display e desenha; o `rvnc` é quem
+captura esse display e entrega para o navegador.
+
+Então, para **criar** um display, é preciso ter um `Xvfb` na máquina:
+
+| Distro | Comando |
+| --- | --- |
+| Alpine | `apk add xvfb` |
+| Debian/Ubuntu | `apt install xvfb` |
+| Fedora/RHEL | `dnf install xorg-x11-server-Xvfb` |
+| Arch | `pacman -S xorg-server-xvfb` |
+
+Para **servir um display que já existe** (`--display :0`), nada disso é
+necessário — o `rvnc` sozinho basta.
+
+O binário em si continua sem dependência dinâmica nenhuma: o `Xvfb` é um
+processo separado que o `rvnc` inicia, não uma biblioteca com a qual ele liga.
+
+Exemplo completo do zero, no Alpine:
+
+```sh
+apk add xvfb xfce4 xfce4-terminal
+./rvnc -l 0.0.0.0:8080 xfce4-session
+```
 
 ## Uso
 
@@ -39,6 +69,9 @@ rvnc --listen 127.0.0.1:6080 --view-only --display :0
 | `-d, --display NOME` | usa um X existente em vez de subir um `Xvfb` |
 | `-g, --geometry WxH` | tamanho do display criado (padrão `1440x900`) |
 | `--depth N` | profundidade de cor do display criado (`16`, `24`, `30`) |
+| `--max-geometry WxH` | maior resolução que os clientes podem pedir (padrão `1920x1200`) |
+| `--allow-origin HOST` | host extra aceito no `Origin`, para proxy reverso; repetível |
+| `--xserver PROG` | qual servidor X iniciar, com a sintaxe do `Xvfb` (padrão `Xvfb`) |
 | `-p, --password SENHA` | senha VNC (o protocolo usa no máximo 8 caracteres) |
 | `--password-file ARQ` | lê a senha da primeira linha do arquivo |
 | `--no-password` | serve sem autenticação nenhuma |
@@ -69,8 +102,8 @@ Alvos usados nos releases: `x86_64-unknown-linux-musl` (amd64),
 `aarch64-unknown-linux-musl` (arm64) e `armv7-unknown-linux-musleabihf`
 (armhf).
 
-Em tempo de execução, o `Xvfb` só é necessário quando o `rvnc` precisa criar o
-display; com `--display` ele não é usado.
+Em tempo de execução, veja [Requisitos](#requisitos): o `Xvfb` só é necessário
+quando o `rvnc` precisa criar o display.
 
 ## Releases
 
@@ -78,6 +111,64 @@ O workflow `.github/workflows/release.yml` roda **só quando disparado à mão**
 (Actions → Release → Run workflow). Ele executa os testes, compila os três
 alvos estáticos, empacota `tar.gz` com `sha256` e publica tudo numa GitHub
 Release. Se a tag não for informada, usa a versão do `Cargo.toml`.
+
+## Atrás de um proxy reverso
+
+O `rvnc` funciona num subcaminho sem configuração extra: a página monta a URL
+do WebSocket relativa a si mesma, então `/vnc/` vira `/vnc/websockify`. Um
+bloco de Caddy como este basta:
+
+```caddyfile
+br.exemplo.com {
+        basicauth {
+                usuario $2a$14$...
+        }
+
+        redir /vnc /vnc/          # a barra final é obrigatória
+        route /vnc/* {
+                uri strip_prefix /vnc
+                reverse_proxy 10.0.3.138:8080
+        }
+}
+```
+
+Dois detalhes:
+
+- A **barra final** importa. Sem ela o navegador resolveria os módulos do
+  noVNC no diretório errado; por isso o `redir`.
+- O `rvnc` recusa WebSocket cujo `Origin` seja de outro host. Ele aceita o
+  `Host` e o `X-Forwarded-Host` (que o Caddy manda por padrão), o que cobre o
+  caso normal. Se o seu proxy reescrever os dois, use
+  `--allow-origin br.exemplo.com`.
+
+Servindo por HTTPS você ganha o clipboard automático do navegador, que exige
+contexto seguro.
+
+## Copiar e colar
+
+A área de transferência é compartilhada nos dois sentidos: o `rvnc` mantém uma
+janela invisível que assume as seleções `CLIPBOARD` e `PRIMARY` do X quando o
+navegador copia algo, e o XFIXES avisa quando algum programa do desktop copia,
+para repassar ao navegador.
+
+No navegador isso é automático quando a página tem permissão de clipboard
+(HTTPS ou localhost). Quando o navegador nega, o botão **Clipboard** abre um
+campo de texto que funciona nos dois sentidos.
+
+O RFB transporta texto em Latin-1, então acentos passam normalmente, mas
+caracteres fora dessa faixa (emoji, CJK) viram `?`.
+
+## Resolução e tela cheia
+
+Por padrão a página está no modo **resize**: o desktop adota o tamanho da
+janela do navegador, então em tela cheia você fica na resolução real do
+monitor, sem escala nem borrão. O botão **Mode** alterna para **scale**, que
+mantém a resolução fixa e apenas ajusta a imagem.
+
+Detalhe do X: um servidor X não cresce além do tamanho com que foi criado.
+Por isso o `rvnc` inicia o `Xvfb` no `--max-geometry` e encolhe para o
+`--geometry`; o teto do que os clientes podem pedir é aquele máximo. Se você
+quer 4K, use `--max-geometry 3840x2160`.
 
 ## Como funciona
 
@@ -98,6 +189,8 @@ Cinco peças, todas dentro do mesmo processo:
    sessão). Raw serve de fallback.
 5. **HTTP/WebSocket** (`src/http.rs`, `src/ws.rs`) — serve o noVNC embutido e
    faz upgrade de `/websockify` para WebSocket, que carrega o RFB puro.
+6. **Clipboard** (`src/clipboard.rs`) — uma janela própria que assume e lê as
+   seleções do X, ligada ao `ClientCutText`/`ServerCutText` do RFB.
 
 ## Segurança
 
@@ -110,9 +203,9 @@ Cinco peças, todas dentro do mesmo processo:
 
 ## O que ainda não tem
 
-- Área de transferência entre navegador e desktop (`ClientCutText` é lido e
-  descartado).
-- Redimensionamento dinâmico da tela: a geometria é fixada no startup.
+- Clipboard fora do Latin-1 (o `ExtendedClipboard` do noVNC, que faria UTF-8,
+  não está implementado) e transferências INCR, usadas para textos enormes.
+- Resolução acima do `--max-geometry`, por causa do limite do servidor X.
 - Codificações Tight/JPEG e CopyRect. Conteúdo fotográfico em tela cheia cai
   em ZRLE raw, que comprime pior que JPEG.
 - Displays com paleta (8 bits). Só true colour de 16, 24 e 32 bits.
@@ -123,12 +216,13 @@ Cinco peças, todas dentro do mesmo processo:
 ## Testes
 
 ```sh
-cargo test                 # 42 testes de unidade
+cargo test                 # 58 testes de unidade
 ```
 
 Para o teste ponta a ponta existe um cliente X de apoio que pinta quadrantes
-de cores conhecidas, anima um quadrado e marca a tela quando recebe clique ou
-tecla:
+de cores conhecidas, anima um quadrado, marca a tela quando recebe clique ou
+tecla, repinta quando a tela muda de tamanho e troca texto pela área de
+transferência:
 
 ```sh
 cargo run --release --example xdraw     # usa $DISPLAY

@@ -187,21 +187,22 @@ pub struct LinkState {
     pub want_full: bool,
     pub pf: PixelFormat,
     pub caps: Caps,
+    /// Set when the screen changed size: the value is the RFB "reason" code
+    /// (0 server-initiated, 1 this client asked, 2 another client asked).
+    pub pending_resize: Option<u16>,
+    /// Clipboard text waiting to go out, already in Latin-1.
+    pub clipboard: Option<Arc<Vec<u8>>>,
 }
 
 /// Which encodings the client asked for.
 #[derive(Clone, Copy, Debug)]
+#[derive(Default)]
 pub struct Caps {
     pub zrle: bool,
     pub cursor: bool,
     pub last_rect: bool,
     pub desktop_size: bool,
-}
-
-impl Default for Caps {
-    fn default() -> Self {
-        Caps { zrle: false, cursor: false, last_rect: false, desktop_size: false }
-    }
+    pub ext_desktop_size: bool,
 }
 
 pub struct ClientLink {
@@ -224,6 +225,8 @@ impl ClientLink {
 pub struct Hub {
     pub frame: RwLock<Frame>,
     pub cursor: Mutex<Option<Arc<CursorImage>>>,
+    /// The most recent clipboard text, handed to clients as they connect.
+    clipboard: Mutex<Option<Arc<Vec<u8>>>>,
     clients: Mutex<Vec<Arc<ClientLink>>>,
     /// Lets the capture loop skip work when nobody is connected.
     client_count: Mutex<usize>,
@@ -234,6 +237,7 @@ impl Hub {
         Arc::new(Hub {
             frame: RwLock::new(Frame::new(width, height)),
             cursor: Mutex::new(None),
+            clipboard: Mutex::new(None),
             clients: Mutex::new(Vec::new()),
             client_count: Mutex::new(0),
         })
@@ -261,6 +265,8 @@ impl Hub {
                 want_full: false,
                 pf: PixelFormat::default_rgb(),
                 caps: Caps::default(),
+                pending_resize: None,
+                clipboard: self.clipboard.lock().unwrap().clone(),
             }),
             cv: Condvar::new(),
         });
@@ -289,6 +295,46 @@ impl Hub {
             for r in rects {
                 st.dirty.add_rect(*r);
             }
+            drop(st);
+            c.cv.notify_all();
+        }
+    }
+
+    /// Adopt a new screen size: the framebuffer is replaced and every client
+    /// is told to redraw everything.
+    pub fn resize(&self, width: u32, height: u32, requester: Option<&Arc<ClientLink>>) {
+        {
+            let mut frame = self.frame.write().unwrap();
+            if frame.width == width && frame.height == height {
+                return;
+            }
+            *frame = Frame::new(width, height);
+        }
+        for c in self.clients.lock().unwrap().iter() {
+            let mut st = c.state.lock().unwrap();
+            st.dirty = TileMap::new(width, height);
+            st.dirty.set_all();
+            st.cursor_dirty = true;
+            st.pending_resize = Some(match requester {
+                Some(r) if Arc::ptr_eq(r, c) => 1,
+                Some(_) => 2,
+                None => 0,
+            });
+            drop(st);
+            c.cv.notify_all();
+        }
+    }
+
+    /// Send clipboard text to every client except `origin`, which is where it
+    /// came from.
+    pub fn broadcast_clipboard(&self, text: Arc<Vec<u8>>, origin: Option<&Arc<ClientLink>>) {
+        *self.clipboard.lock().unwrap() = Some(text.clone());
+        for c in self.clients.lock().unwrap().iter() {
+            if origin.map(|o| Arc::ptr_eq(o, c)).unwrap_or(false) {
+                continue;
+            }
+            let mut st = c.state.lock().unwrap();
+            st.clipboard = Some(text.clone());
             drop(st);
             c.cv.notify_all();
         }
@@ -341,6 +387,44 @@ mod tests {
         let rects = t.take_rects(640, 480);
         assert_eq!(rects.len(), 2);
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn resize_replaces_the_frame_and_marks_everyone() {
+        let hub = Hub::new(320, 240);
+        let a = hub.register();
+        let b = hub.register();
+        for link in [&a, &b] {
+            let mut st = link.state.lock().unwrap();
+            st.dirty.clear_all();
+            st.pending_resize = None;
+        }
+
+        hub.resize(640, 480, Some(&a));
+        assert_eq!(hub.dimensions(), (640, 480));
+        // The client that asked is told so; the other sees a foreign resize.
+        assert_eq!(a.state.lock().unwrap().pending_resize, Some(1));
+        assert_eq!(b.state.lock().unwrap().pending_resize, Some(2));
+        assert!(!a.state.lock().unwrap().dirty.is_empty());
+
+        // A no-op resize does not disturb anyone.
+        b.state.lock().unwrap().pending_resize = None;
+        hub.resize(640, 480, None);
+        assert_eq!(b.state.lock().unwrap().pending_resize, None);
+    }
+
+    #[test]
+    fn clipboard_skips_the_client_it_came_from() {
+        let hub = Hub::new(320, 240);
+        let a = hub.register();
+        let b = hub.register();
+        hub.broadcast_clipboard(Arc::new(b"hi".to_vec()), Some(&a));
+        assert!(a.state.lock().unwrap().clipboard.is_none());
+        assert_eq!(b.state.lock().unwrap().clipboard.as_deref(), Some(&b"hi".to_vec()));
+
+        // Someone joining later still receives what is on the clipboard.
+        let c = hub.register();
+        assert_eq!(c.state.lock().unwrap().clipboard.as_deref(), Some(&b"hi".to_vec()));
     }
 
     #[test]

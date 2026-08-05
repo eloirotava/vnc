@@ -7,12 +7,14 @@ use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::damage::{self, ConnectionExt as _};
+use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{self, ConnectionExt as _, ImageFormat, ImageOrder};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
+use x11rb::CURRENT_TIME;
 
 use crate::http::log;
 use crate::screen::{CursorImage, Frame, Hub, Rect};
@@ -143,6 +145,13 @@ impl Capture {
             .is_some();
         self.has_xfixes = xfixes_ok;
 
+        // Root configure events tell us when the screen is resized.
+        let _ = self.conn.change_window_attributes(
+            self.root,
+            &xproto::ChangeWindowAttributesAux::new()
+                .event_mask(xproto::EventMask::STRUCTURE_NOTIFY),
+        );
+
         if xfixes_ok {
             let _ = self.conn.xfixes_select_cursor_input(
                 self.root,
@@ -177,8 +186,27 @@ impl Capture {
         self.damage.is_some()
     }
 
-    /// Read one rectangle of the screen into `frame`.
+    /// Adopt a new screen size after a resize.
+    pub fn set_size(&mut self, width: u16, height: u16) {
+        self.width = width;
+        self.height = height;
+    }
+
+    /// Read one rectangle of the screen into `frame`. The rectangle is
+    /// clipped to the screen, which can shrink under us when a client asks
+    /// for a different resolution.
     pub fn grab(&self, frame: &mut Frame, r: Rect) -> XResult<()> {
+        let r = Rect {
+            x: r.x.min(self.width as u32),
+            y: r.y.min(self.height as u32),
+            w: r.w.min((self.width as u32).saturating_sub(r.x)),
+            h: r.h.min((self.height as u32).saturating_sub(r.y)),
+        };
+        let r = Rect {
+            w: r.w.min(frame.width.saturating_sub(r.x)),
+            h: r.h.min(frame.height.saturating_sub(r.y)),
+            ..r
+        };
         if r.w == 0 || r.h == 0 {
             return Ok(());
         }
@@ -286,10 +314,10 @@ impl Capture {
 }
 
 /// Capture loop: feeds the hub until it fails or the process exits.
-pub fn run_capture(cap: Capture, hub: Arc<Hub>, max_fps: u32) -> XResult<()> {
+pub fn run_capture(mut cap: Capture, hub: Arc<Hub>, max_fps: u32) -> XResult<()> {
     let interval = Duration::from_micros(1_000_000 / max_fps.clamp(1, 120) as u64);
     let idle = Duration::from_millis(250);
-    let full = cap.full_rect();
+    let mut full = cap.full_rect();
 
     // Prime the framebuffer and the cursor.
     {
@@ -303,15 +331,40 @@ pub fn run_capture(cap: Capture, hub: Arc<Hub>, max_fps: u32) -> XResult<()> {
     let mut stale = false;
     loop {
         let started = Instant::now();
+
         let mut damaged = false;
         let mut cursor_changed = false;
+        let mut resized = None;
 
         while let Some(event) = cap.conn.poll_for_event()? {
             match event {
                 Event::DamageNotify(_) => damaged = true,
                 Event::XfixesCursorNotify(_) => cursor_changed = true,
+                Event::ConfigureNotify(e) if e.window == cap.root => {
+                    if (e.width, e.height) != (cap.width, cap.height) {
+                        resized = Some((e.width, e.height));
+                    }
+                }
                 _ => {}
             }
+        }
+
+        // The screen changed size, either because a client asked or because
+        // something else on the display did it.
+        if let Some((w, h)) = resized {
+            log::debug(&format!("capture: screen is now {w}x{h}"));
+            cap.set_size(w, h);
+            full = cap.full_rect();
+            hub.resize(w as u32, h as u32, None);
+            stale = true;
+        }
+
+        // The hub may already know about a resize we have not seen yet.
+        let (hub_w, hub_h) = hub.dimensions();
+        if (hub_w, hub_h) != (cap.width as u32, cap.height as u32) {
+            cap.set_size(hub_w as u16, hub_h as u16);
+            full = cap.full_rect();
+            stale = true;
         }
 
         if !hub.has_clients() {
@@ -571,5 +624,98 @@ mod tests {
         let c565 = Channel::new(0xf800);
         assert_eq!(c565.take(0xf800), 255);
         assert_eq!(c565.take(0), 0);
+    }
+}
+
+/// Screen resizing through RandR.
+///
+/// An X server can only shrink to sizes inside the range it reports, and
+/// Xvfb's maximum is fixed at the size it was started with. rvnc therefore
+/// starts Xvfb at the largest size it will ever need and shrinks from there.
+pub struct Resizer {
+    conn: RustConnection,
+    root: xproto::Window,
+    crtc: randr::Crtc,
+    output: randr::Output,
+    pub max: (u16, u16),
+    pub min: (u16, u16),
+}
+
+impl Resizer {
+    pub fn open(display: Option<&str>) -> Option<Self> {
+        let (conn, screen_num) = RustConnection::connect(display).ok()?;
+        let root = conn.setup().roots[screen_num].root;
+        conn.randr_query_version(1, 2).ok()?.reply().ok()?;
+
+        let range = conn.randr_get_screen_size_range(root).ok()?.reply().ok()?;
+        let res = conn
+            .randr_get_screen_resources_current(root)
+            .ok()?
+            .reply()
+            .ok()?;
+
+        Some(Resizer {
+            conn,
+            root,
+            crtc: *res.crtcs.first()?,
+            output: *res.outputs.first()?,
+            max: (range.max_width, range.max_height),
+            min: (range.min_width.max(16), range.min_height.max(16)),
+        })
+    }
+
+    /// Resize the screen, clamped to what the server allows. Returns the size
+    /// actually in effect afterwards.
+    pub fn resize(&self, width: u16, height: u16) -> XResult<(u16, u16)> {
+        let w = width.clamp(self.min.0, self.max.0);
+        let h = height.clamp(self.min.1, self.max.1);
+
+        let current = self.conn.get_geometry(self.root)?.reply()?;
+        if (current.width, current.height) == (w, h) {
+            return Ok((w, h));
+        }
+
+        // The CRTC has to let go of the framebuffer before it can shrink.
+        let _ = self
+            .conn
+            .randr_set_crtc_config(
+                self.crtc,
+                CURRENT_TIME,
+                CURRENT_TIME,
+                0,
+                0,
+                0,
+                randr::Rotation::ROTATE0,
+                &[],
+            )?
+            .reply();
+
+        // Millimetres at a nominal 96 dpi, so applications compute sane DPI.
+        let mm = |px: u16| (px as u32 * 254 / 960).max(1);
+        self.conn
+            .randr_set_screen_size(self.root, w, h, mm(w), mm(h))?
+            .check()?;
+
+        // Re-attach the CRTC if the server happens to have a matching mode.
+        // Xvfb does not let us add one, and leaving it off still gives the
+        // right screen size, which is what clients and toolkits read.
+        if let Ok(res) = self.conn.randr_get_screen_resources_current(self.root)?.reply() {
+            if let Some(mode) = res.modes.iter().find(|m| m.width == w && m.height == h) {
+                let _ = self.conn.randr_set_crtc_config(
+                    self.crtc,
+                    CURRENT_TIME,
+                    CURRENT_TIME,
+                    0,
+                    0,
+                    mode.id,
+                    randr::Rotation::ROTATE0,
+                    &[self.output],
+                )?;
+            }
+        }
+
+        self.conn.sync()?;
+        let now = self.conn.get_geometry(self.root)?.reply()?;
+        Ok((now.width, now.height))
     }
 }
