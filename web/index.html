@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>rvnc</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%232a6df4'/><rect x='3' y='4.5' width='10' height='7' rx='1' fill='%23fff'/></svg>">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #14161a; color: #e6e8ec;
+               font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  #screen { width: 100%; height: 100%; overflow: hidden; }
+  #bar { position: fixed; inset: 0 0 auto 0; display: flex; gap: .5rem; align-items: center;
+         padding: .35rem .6rem; background: #1d2026e6; border-bottom: 1px solid #2b2f38;
+         backdrop-filter: blur(6px); transform: translateY(-100%); transition: transform .15s;
+         z-index: 10; }
+  #bar.show, #bar:hover, #bar:focus-within { transform: none; }
+  #peek { position: fixed; top: 0; left: 0; right: 0; height: 8px; z-index: 9; }
+  #status { flex: 1; color: #9aa3b2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  button { background: #2a2f3a; color: inherit; border: 1px solid #3a4150; border-radius: 6px;
+           padding: .25rem .6rem; font: inherit; cursor: pointer; }
+  button:hover { background: #343b49; }
+  #login { position: fixed; inset: 0; display: none; place-items: center; background: #14161a; z-index: 20; }
+  #login form { display: grid; gap: .75rem; width: min(20rem, 90vw); }
+  #login h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+  input { background: #1d2026; color: inherit; border: 1px solid #3a4150; border-radius: 6px;
+          padding: .5rem .6rem; font: inherit; }
+  #error { color: #ff8f8f; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<div id="peek"></div>
+<div id="bar">
+  <strong>rvnc</strong>
+  <span id="status">connecting…</span>
+  <button id="cad" title="Send Ctrl+Alt+Delete">Ctrl+Alt+Del</button>
+  <button id="fit" title="Toggle scaling to fit the window">Fit: on</button>
+  <button id="full" title="Fullscreen">Fullscreen</button>
+</div>
+<div id="screen"></div>
+
+<div id="login">
+  <form id="loginform">
+    <h1>Password required</h1>
+    <input id="password" type="password" autocomplete="current-password" autofocus>
+    <button type="submit">Connect</button>
+    <div id="error"></div>
+  </form>
+</div>
+
+<script type="module">
+import RFB from './novnc/core/rfb.js';
+import * as Log from './novnc/core/util/logging.js';
+
+const params = new URLSearchParams(location.search);
+if (params.get('debug')) Log.initLogging('debug');
+const el = (id) => document.getElementById(id);
+const status = el('status');
+const bar = el('bar');
+let rfb = null;
+let scaling = params.get('scale') !== 'off';
+
+function url() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${proto}://${location.host}/websockify`;
+}
+
+function say(text, sticky) {
+  status.textContent = text;
+  bar.classList.add('show');
+  if (!sticky) setTimeout(() => bar.classList.remove('show'), 2500);
+}
+
+function connect(password) {
+  el('login').style.display = 'none';
+  say('connecting…', true);
+
+  rfb = new RFB(el('screen'), url(), { credentials: password ? { password } : {} });
+  rfb.scaleViewport = scaling;
+  rfb.resizeSession = false;
+  rfb.showDotCursor = true;
+
+  rfb.addEventListener('connect', () => {
+    say('connected');
+    document.title = rfb.desktopName || 'rvnc';
+  });
+
+  rfb.addEventListener('credentialsrequired', () => {
+    askPassword('');
+  });
+
+  rfb.addEventListener('securityfailure', (e) => {
+    askPassword(e.detail.reason || 'Authentication failed');
+  });
+
+  rfb.addEventListener('disconnect', (e) => {
+    rfb = null;
+    if (e.detail.clean) {
+      say('disconnected — reconnecting…', true);
+      setTimeout(() => connect(password), 1000);
+    } else {
+      say('connection lost — retrying…', true);
+      setTimeout(() => connect(password), 2000);
+    }
+  });
+}
+
+function askPassword(message) {
+  if (rfb) { try { rfb.disconnect(); } catch (_) {} rfb = null; }
+  el('error').textContent = message;
+  el('login').style.display = 'grid';
+  el('password').focus();
+}
+
+el('loginform').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const value = el('password').value;
+  sessionStorage.setItem('rvnc-password', value);
+  connect(value);
+});
+
+el('cad').addEventListener('click', () => rfb && rfb.sendCtrlAltDel());
+
+el('fit').addEventListener('click', () => {
+  scaling = !scaling;
+  el('fit').textContent = `Fit: ${scaling ? 'on' : 'off'}`;
+  if (rfb) rfb.scaleViewport = scaling;
+});
+
+el('full').addEventListener('click', () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen();
+});
+
+el('peek').addEventListener('mouseenter', () => bar.classList.add('show'));
+bar.addEventListener('mouseleave', () => bar.classList.remove('show'));
+
+const saved = params.get('password') || sessionStorage.getItem('rvnc-password') || '';
+connect(saved);
+</script>
+</body>
+</html>

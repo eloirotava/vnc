@@ -1,0 +1,123 @@
+name: Release
+
+# Manual only: pick "Run workflow" in the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (defaults to v + the version in Cargo.toml)'
+        required: false
+        type: string
+      draft:
+        description: 'Publish as a draft'
+        required: false
+        default: false
+        type: boolean
+      prerelease:
+        description: 'Mark as a pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - run: cargo test --locked --all-targets
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+          - arch: armhf
+            target: armv7-unknown-linux-musleabihf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and the target
+        run: |
+          rustup update stable && rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      # rvnc has no C dependencies, so rust-lld links a fully static musl
+      # binary without any cross toolchain or container.
+      - name: Build
+        env:
+          RUSTFLAGS: -C linker=rust-lld -C target-feature=+crt-static
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check that the binary is static
+        run: |
+          file target/${{ matrix.target }}/release/rvnc
+          file target/${{ matrix.target }}/release/rvnc | grep -q 'statically linked\|static-pie linked'
+
+      - name: Package
+        id: package
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          name="rvnc-${version}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/rvnc "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag='${{ inputs.tag }}'
+          if [ -z "$tag" ]; then
+            tag="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
+          echo "Releasing $tag from $GITHUB_SHA"
+          ls -la artifacts
+
+          args=(--target "$GITHUB_SHA" --title "rvnc $tag" --generate-notes)
+          [ '${{ inputs.draft }}' = 'true' ] && args+=(--draft)
+          [ '${{ inputs.prerelease }}' = 'true' ] && args+=(--prerelease)
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/* --clobber
+          else
+            gh release create "$tag" "${args[@]}" artifacts/*
+          fi

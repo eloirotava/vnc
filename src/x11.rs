@@ -1,0 +1,575 @@
+//! X11 backend: screen capture through XDAMAGE/GetImage, pointer and
+//! keyboard injection through XTEST, cursor shapes through XFIXES.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use x11rb::connection::Connection;
+use x11rb::protocol::damage::{self, ConnectionExt as _};
+use x11rb::protocol::xfixes::{self, ConnectionExt as _};
+use x11rb::protocol::xproto::{self, ConnectionExt as _, ImageFormat, ImageOrder};
+use x11rb::protocol::xtest::ConnectionExt as _;
+use x11rb::protocol::Event;
+use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
+
+use crate::http::log;
+use crate::screen::{CursorImage, Frame, Hub, Rect};
+
+pub type XResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// How the X server lays out pixels in `GetImage` replies.
+#[derive(Clone, Copy)]
+struct ImageFmt {
+    bits_per_pixel: u8,
+    scanline_pad: u8,
+    big_endian: bool,
+    red: Channel,
+    green: Channel,
+    blue: Channel,
+    /// The common case: 32bpp little-endian BGRX, copied without conversion.
+    fast_bgrx: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Channel {
+    shift: u32,
+    max: u32,
+}
+
+impl Channel {
+    fn new(mask: u32) -> Self {
+        if mask == 0 {
+            return Channel { shift: 0, max: 1 };
+        }
+        let shift = mask.trailing_zeros();
+        Channel { shift, max: mask >> shift }
+    }
+
+    #[inline]
+    fn take(&self, raw: u32) -> u32 {
+        let v = (raw >> self.shift) & self.max;
+        if self.max == 255 {
+            v
+        } else {
+            (v * 255 + self.max / 2) / self.max
+        }
+    }
+}
+
+/// Capture side: owns its own X connection and the damage object.
+pub struct Capture {
+    conn: RustConnection,
+    root: xproto::Window,
+    pub width: u16,
+    pub height: u16,
+    fmt: ImageFmt,
+    damage: Option<damage::Damage>,
+    region: Option<xfixes::Region>,
+    pub has_xfixes: bool,
+}
+
+impl Capture {
+    pub fn open(display: Option<&str>) -> XResult<Self> {
+        let (conn, screen_num) = RustConnection::connect(display)?;
+        let setup = conn.setup();
+        let screen = &setup.roots[screen_num];
+        let root = screen.root;
+        let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
+
+        let visual = screen
+            .allowed_depths
+            .iter()
+            .flat_map(|d| d.visuals.iter().map(move |v| (d.depth, v)))
+            .find(|(_, v)| v.visual_id == screen.root_visual)
+            .ok_or("root visual not found in the server setup")?;
+        let (depth, visual) = visual;
+
+        let pixmap_fmt = setup
+            .pixmap_formats
+            .iter()
+            .find(|f| f.depth == depth)
+            .ok_or("no pixmap format for the root depth")?;
+
+        if !matches!(pixmap_fmt.bits_per_pixel, 16 | 24 | 32) {
+            return Err(format!(
+                "unsupported X server pixel size: {} bits (need 16, 24 or 32)",
+                pixmap_fmt.bits_per_pixel
+            )
+            .into());
+        }
+        if visual.red_mask == 0 {
+            return Err("the root visual is not true colour (palette displays are not supported)".into());
+        }
+
+        let big_endian = setup.image_byte_order == ImageOrder::MSB_FIRST;
+        let fmt = ImageFmt {
+            bits_per_pixel: pixmap_fmt.bits_per_pixel,
+            scanline_pad: pixmap_fmt.scanline_pad,
+            big_endian,
+            red: Channel::new(visual.red_mask),
+            green: Channel::new(visual.green_mask),
+            blue: Channel::new(visual.blue_mask),
+            fast_bgrx: pixmap_fmt.bits_per_pixel == 32
+                && !big_endian
+                && visual.red_mask == 0x00ff_0000
+                && visual.green_mask == 0x0000_ff00
+                && visual.blue_mask == 0x0000_00ff,
+        };
+
+        let mut cap = Capture {
+            conn,
+            root,
+            width,
+            height,
+            fmt,
+            damage: None,
+            region: None,
+            has_xfixes: false,
+        };
+        cap.setup_extensions();
+        Ok(cap)
+    }
+
+    /// XDAMAGE and XFIXES are optional; without them we fall back to polling
+    /// the whole screen.
+    fn setup_extensions(&mut self) {
+        let xfixes_ok = self
+            .conn
+            .xfixes_query_version(5, 0)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some();
+        self.has_xfixes = xfixes_ok;
+
+        if xfixes_ok {
+            let _ = self.conn.xfixes_select_cursor_input(
+                self.root,
+                xfixes::CursorNotifyMask::DISPLAY_CURSOR,
+            );
+        }
+
+        let damage_ok = self
+            .conn
+            .damage_query_version(1, 1)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some();
+
+        if damage_ok && xfixes_ok {
+            if let (Ok(dmg), Ok(reg)) = (self.conn.generate_id(), self.conn.generate_id()) {
+                let created = self
+                    .conn
+                    .damage_create(dmg, self.root, damage::ReportLevel::NON_EMPTY)
+                    .is_ok()
+                    && self.conn.xfixes_create_region(reg, &[]).is_ok();
+                if created && self.conn.flush().is_ok() {
+                    self.damage = Some(dmg);
+                    self.region = Some(reg);
+                }
+            }
+        }
+        let _ = self.conn.flush();
+    }
+
+    pub fn has_damage(&self) -> bool {
+        self.damage.is_some()
+    }
+
+    /// Read one rectangle of the screen into `frame`.
+    pub fn grab(&self, frame: &mut Frame, r: Rect) -> XResult<()> {
+        if r.w == 0 || r.h == 0 {
+            return Ok(());
+        }
+        let reply = self
+            .conn
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                self.root,
+                r.x as i16,
+                r.y as i16,
+                r.w as u16,
+                r.h as u16,
+                u32::MAX,
+            )?
+            .reply()?;
+
+        let bpp = self.fmt.bits_per_pixel as usize;
+        let pad = self.fmt.scanline_pad as usize;
+        let stride = ((r.w as usize * bpp + pad - 1) / pad) * (pad / 8);
+        if reply.data.len() < stride * r.h as usize {
+            return Err("short GetImage reply".into());
+        }
+
+        for row in 0..r.h {
+            let src = &reply.data[row as usize * stride..];
+            let dst_start = (r.y + row) as usize * frame.width as usize + r.x as usize;
+            let dst = &mut frame.px[dst_start..dst_start + r.w as usize];
+            self.convert_row(src, dst);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn convert_row(&self, src: &[u8], dst: &mut [u32]) {
+        let f = &self.fmt;
+        if f.fast_bgrx {
+            for (i, px) in dst.iter_mut().enumerate() {
+                let b = &src[i * 4..i * 4 + 4];
+                *px = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x00ff_ffff;
+            }
+            return;
+        }
+        let bytes = f.bits_per_pixel as usize / 8;
+        for (i, px) in dst.iter_mut().enumerate() {
+            let b = &src[i * bytes..i * bytes + bytes];
+            let raw = match (bytes, f.big_endian) {
+                (2, false) => u16::from_le_bytes([b[0], b[1]]) as u32,
+                (2, true) => u16::from_be_bytes([b[0], b[1]]) as u32,
+                (3, false) => u32::from_le_bytes([b[0], b[1], b[2], 0]),
+                (3, true) => u32::from_be_bytes([0, b[0], b[1], b[2]]),
+                (_, false) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                (_, true) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
+            };
+            *px = f.red.take(raw) << 16 | f.green.take(raw) << 8 | f.blue.take(raw);
+        }
+    }
+
+    /// Collect the damaged rectangles reported since the last call.
+    fn take_damage(&self) -> XResult<Vec<Rect>> {
+        let (Some(dmg), Some(reg)) = (self.damage, self.region) else {
+            return Ok(Vec::new());
+        };
+        self.conn.damage_subtract(dmg, x11rb::NONE, reg)?;
+        let reply = self.conn.xfixes_fetch_region(reg)?.reply()?;
+        let mut out = Vec::with_capacity(reply.rectangles.len());
+        for r in reply.rectangles {
+            if let Some(rect) = self.clamp(r) {
+                out.push(rect);
+            }
+        }
+        Ok(out)
+    }
+
+    fn clamp(&self, r: xproto::Rectangle) -> Option<Rect> {
+        let x0 = r.x.max(0) as u32;
+        let y0 = r.y.max(0) as u32;
+        let x1 = (r.x as i32 + r.width as i32).clamp(0, self.width as i32) as u32;
+        let y1 = (r.y as i32 + r.height as i32).clamp(0, self.height as i32) as u32;
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some(Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+    }
+
+    pub fn cursor(&self) -> XResult<Option<CursorImage>> {
+        if !self.has_xfixes {
+            return Ok(None);
+        }
+        let c = self.conn.xfixes_get_cursor_image()?.reply()?;
+        if c.width == 0 || c.height == 0 {
+            return Ok(None);
+        }
+        Ok(Some(CursorImage {
+            width: c.width,
+            height: c.height,
+            hot_x: c.xhot,
+            hot_y: c.yhot,
+            argb: c.cursor_image,
+        }))
+    }
+
+    fn full_rect(&self) -> Rect {
+        Rect { x: 0, y: 0, w: self.width as u32, h: self.height as u32 }
+    }
+}
+
+/// Capture loop: feeds the hub until it fails or the process exits.
+pub fn run_capture(cap: Capture, hub: Arc<Hub>, max_fps: u32) -> XResult<()> {
+    let interval = Duration::from_micros(1_000_000 / max_fps.clamp(1, 120) as u64);
+    let idle = Duration::from_millis(250);
+    let full = cap.full_rect();
+
+    // Prime the framebuffer and the cursor.
+    {
+        let mut frame = hub.frame.write().unwrap();
+        cap.grab(&mut frame, full)?;
+    }
+    if let Ok(Some(c)) = cap.cursor() {
+        hub.set_cursor(Some(Arc::new(c)));
+    }
+
+    let mut stale = false;
+    loop {
+        let started = Instant::now();
+        let mut damaged = false;
+        let mut cursor_changed = false;
+
+        while let Some(event) = cap.conn.poll_for_event()? {
+            match event {
+                Event::DamageNotify(_) => damaged = true,
+                Event::XfixesCursorNotify(_) => cursor_changed = true,
+                _ => {}
+            }
+        }
+
+        if !hub.has_clients() {
+            // Nobody is watching: keep draining damage so the X server does
+            // not accumulate it, but skip the expensive GetImage calls.
+            if damaged {
+                let _ = cap.take_damage()?;
+                stale = true;
+            }
+            cap.conn.flush()?;
+            std::thread::sleep(idle);
+            continue;
+        }
+
+        let mut rects = if !cap.has_damage() {
+            vec![full]
+        } else if damaged {
+            cap.take_damage()?
+        } else {
+            Vec::new()
+        };
+
+        if stale {
+            rects = vec![full];
+            stale = false;
+        }
+
+        if !rects.is_empty() {
+            log::debug(&format!("capture: {} rect(s), first {:?}", rects.len(), rects[0]));
+            let mut frame = hub.frame.write().unwrap();
+            for r in &rects {
+                cap.grab(&mut frame, *r)?;
+            }
+            drop(frame);
+            hub.damage(&rects);
+        }
+
+        if cursor_changed {
+            if let Ok(Some(c)) = cap.cursor() {
+                hub.set_cursor(Some(Arc::new(c)));
+            }
+        }
+
+        cap.conn.flush()?;
+        let elapsed = started.elapsed();
+        if elapsed < interval {
+            std::thread::sleep(interval - elapsed);
+        }
+    }
+}
+
+/// Input side: a second X connection used only for XTEST.
+pub struct Input {
+    conn: RustConnection,
+    root: xproto::Window,
+    /// keysym -> (keycode, needs shift)
+    map: HashMap<u32, (u8, bool)>,
+    shift_keycode: Option<u8>,
+    /// Keycodes with no symbols attached, reusable for unmapped keysyms.
+    spare: Vec<u8>,
+    spare_next: usize,
+    /// keysym -> keycode we remapped it onto.
+    remapped: HashMap<u32, u8>,
+    remap_order: VecDeque<u32>,
+    keysyms_per_keycode: u8,
+    /// Keys the client currently holds down: keysym -> keycode.
+    pressed: HashMap<u32, u8>,
+    buttons: u32,
+}
+
+/// X11 keysyms we need by name.
+mod keysym {
+    pub const SHIFT_L: u32 = 0xffe1;
+    pub const SHIFT_R: u32 = 0xffe2;
+}
+
+impl Input {
+    pub fn open(display: Option<&str>) -> XResult<Self> {
+        let (conn, screen_num) = RustConnection::connect(display)?;
+        let root = conn.setup().roots[screen_num].root;
+        conn.xtest_get_version(2, 2)?
+            .reply()
+            .map_err(|_| "the X server has no XTEST extension; input injection is impossible")?;
+
+        let mut input = Input {
+            conn,
+            root,
+            map: HashMap::new(),
+            shift_keycode: None,
+            spare: Vec::new(),
+            spare_next: 0,
+            remapped: HashMap::new(),
+            remap_order: VecDeque::new(),
+            keysyms_per_keycode: 1,
+            pressed: HashMap::new(),
+            buttons: 0,
+        };
+        input.load_keymap()?;
+        Ok(input)
+    }
+
+    fn load_keymap(&mut self) -> XResult<()> {
+        let setup = self.conn.setup();
+        let (min, max) = (setup.min_keycode, setup.max_keycode);
+        let count = max - min + 1;
+        let reply = self.conn.get_keyboard_mapping(min, count)?.reply()?;
+        let per = reply.keysyms_per_keycode.max(1);
+        self.keysyms_per_keycode = per;
+
+        self.map.clear();
+        self.spare.clear();
+        for i in 0..count as usize {
+            let keycode = min + i as u8;
+            let syms = &reply.keysyms[i * per as usize..(i + 1) * per as usize];
+            if syms.iter().all(|&s| s == 0) {
+                self.spare.push(keycode);
+                continue;
+            }
+            // Column 0 is unshifted, column 1 is shifted; later columns need
+            // group switching, which we do not drive.
+            for (col, &sym) in syms.iter().take(2).enumerate() {
+                if sym != 0 {
+                    self.map.entry(sym).or_insert((keycode, col == 1));
+                }
+            }
+        }
+
+        let mods = self.conn.get_modifier_mapping()?.reply()?;
+        let per_mod = mods.keycodes_per_modifier() as usize;
+        self.shift_keycode = mods
+            .keycodes
+            .get(..per_mod)
+            .and_then(|shift| shift.iter().copied().find(|&k| k != 0));
+        Ok(())
+    }
+
+    fn fake(&self, type_: u8, detail: u8, x: i16, y: i16) -> XResult<()> {
+        self.conn.xtest_fake_input(type_, detail, 0, self.root, x, y, 0)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn pointer(&mut self, x: u16, y: u16, mask: u8) -> XResult<()> {
+        self.fake(xproto::MOTION_NOTIFY_EVENT, 0, x as i16, y as i16)?;
+        // RFB button mask bits map 1:1 onto X button numbers 1..=8.
+        for bit in 0..8u32 {
+            let now = mask as u32 >> bit & 1;
+            let before = self.buttons >> bit & 1;
+            if now != before {
+                let type_ = if now == 1 {
+                    xproto::BUTTON_PRESS_EVENT
+                } else {
+                    xproto::BUTTON_RELEASE_EVENT
+                };
+                self.fake(type_, bit as u8 + 1, 0, 0)?;
+            }
+        }
+        self.buttons = mask as u32;
+        Ok(())
+    }
+
+    pub fn key(&mut self, keysym: u32, down: bool) -> XResult<()> {
+        if !down {
+            if let Some(keycode) = self.pressed.remove(&keysym) {
+                self.fake(xproto::KEY_RELEASE_EVENT, keycode, 0, 0)?;
+            }
+            return Ok(());
+        }
+        if self.pressed.contains_key(&keysym) {
+            // Auto-repeat: release and press again so the application sees it.
+            let keycode = self.pressed[&keysym];
+            self.fake(xproto::KEY_RELEASE_EVENT, keycode, 0, 0)?;
+        }
+
+        let (keycode, needs_shift) = match self.resolve(keysym)? {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+
+        let client_holds_shift = self.pressed.contains_key(&keysym::SHIFT_L)
+            || self.pressed.contains_key(&keysym::SHIFT_R);
+        let synth_shift = needs_shift && !client_holds_shift;
+
+        if synth_shift {
+            if let Some(sk) = self.shift_keycode {
+                self.fake(xproto::KEY_PRESS_EVENT, sk, 0, 0)?;
+            }
+        }
+        self.fake(xproto::KEY_PRESS_EVENT, keycode, 0, 0)?;
+        if synth_shift {
+            if let Some(sk) = self.shift_keycode {
+                self.fake(xproto::KEY_RELEASE_EVENT, sk, 0, 0)?;
+            }
+        }
+        self.pressed.insert(keysym, keycode);
+        Ok(())
+    }
+
+    /// Find a keycode for a keysym, borrowing a spare keycode for symbols the
+    /// current layout cannot produce (the trick x11vnc uses).
+    fn resolve(&mut self, keysym: u32) -> XResult<Option<(u8, bool)>> {
+        if let Some(&v) = self.map.get(&keysym) {
+            return Ok(Some(v));
+        }
+        if let Some(&kc) = self.remapped.get(&keysym) {
+            return Ok(Some((kc, false)));
+        }
+        if self.spare.is_empty() {
+            return Ok(None);
+        }
+
+        let kc = self.spare[self.spare_next % self.spare.len()];
+        self.spare_next += 1;
+
+        // Evict whoever was using this keycode before.
+        if self.remap_order.len() >= self.spare.len() {
+            if let Some(old) = self.remap_order.pop_front() {
+                self.remapped.remove(&old);
+            }
+        }
+
+        let syms = vec![keysym; self.keysyms_per_keycode as usize];
+        self.conn
+            .change_keyboard_mapping(1, kc, self.keysyms_per_keycode, &syms)?;
+        self.conn.sync()?;
+        // Give clients a moment to process the MappingNotify before we press.
+        std::thread::sleep(Duration::from_millis(10));
+
+        self.remapped.insert(keysym, kc);
+        self.remap_order.push_back(keysym);
+        Ok(Some((kc, false)))
+    }
+
+    /// Release everything this client left held down.
+    pub fn release_all(&mut self) {
+        let held: Vec<(u32, u8)> = self.pressed.drain().collect();
+        for (_, keycode) in held {
+            let _ = self.fake(xproto::KEY_RELEASE_EVENT, keycode, 0, 0);
+        }
+        for bit in 0..8u32 {
+            if self.buttons >> bit & 1 == 1 {
+                let _ = self.fake(xproto::BUTTON_RELEASE_EVENT, bit as u8 + 1, 0, 0);
+            }
+        }
+        self.buttons = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_scales_to_eight_bits() {
+        let c = Channel::new(0x00ff_0000);
+        assert_eq!(c.take(0x00ab_0000), 0xab);
+        let c565 = Channel::new(0xf800);
+        assert_eq!(c565.take(0xf800), 255);
+        assert_eq!(c565.take(0), 0);
+    }
+}
