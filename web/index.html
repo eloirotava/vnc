@@ -490,6 +490,7 @@ function sendKeyCombo(keys) {
 
 el('btn-win').addEventListener('click', () => {
   sendKeyCombo([{ sym: 0xffeb, code: 'MetaLeft' }]);
+  toast('Win / Super key sent');
 });
 
 el('btn-alttab').addEventListener('click', () => {
@@ -506,10 +507,18 @@ el('btn-esc').addEventListener('click', () => {
 
 el('btn-ctrlc').addEventListener('click', () => {
   sendKeyCombo([{ sym: 0xffe3, code: 'ControlLeft' }, { sym: 0x0063, code: 'KeyC' }]);
+  toast('Ctrl+C sent');
 });
 
-el('btn-ctrlv').addEventListener('click', () => {
+el('btn-ctrlv').addEventListener('click', async () => {
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) sendClipboard(text);
+    } catch (_) {}
+  }
   sendKeyCombo([{ sym: 0xffe3, code: 'ControlLeft' }, { sym: 0x0076, code: 'KeyV' }]);
+  toast('Pasted to desktop');
 });
 
 // In-Browser Screen Recorder (WebM)
@@ -658,6 +667,7 @@ function sendClipboard(text) {
   rfb.clipboardPasteFrom(text);
 }
 
+// Fallback clipboard modal button
 el('clip').addEventListener('click', () => {
   el('clipboard').style.display = 'grid';
   el('cliptext').value = lastClipboard;
@@ -670,6 +680,7 @@ el('clipclose').addEventListener('click', () => {
 el('clipcopy').addEventListener('click', () => {
   if (navigator.clipboard) {
     navigator.clipboard.writeText(el('cliptext').value);
+    toast('Copied to device clipboard');
   }
 });
 el('cliptext').addEventListener('input', (e) => sendClipboard(e.target.value));
@@ -683,18 +694,43 @@ el('statsclose').addEventListener('click', () => {
   el('stats').style.display = 'none';
 });
 
-// Auto-clipboard sync on focus & paste
+// Direct, automatic clipboard sync on focus, click, and paste
 async function pullBrowserClipboard() {
   if (!navigator.clipboard || !navigator.clipboard.readText) return;
   try {
     const text = await navigator.clipboard.readText();
-    if (text) sendClipboard(text);
+    if (text && text !== lastClipboard) {
+      sendClipboard(text);
+    }
   } catch (_) {}
 }
+
 window.addEventListener('focus', pullBrowserClipboard);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') pullBrowserClipboard();
+});
+el('screen').addEventListener('pointerdown', pullBrowserClipboard);
+
+// Intercept paste directly anywhere on the page
 document.addEventListener('paste', (e) => {
   const text = e.clipboardData && e.clipboardData.getData('text');
-  if (text) sendClipboard(text);
+  if (text) {
+    sendClipboard(text);
+    // Directly inject paste keys to remote desktop
+    rfb && sendKeyCombo([{ sym: 0xffe3, code: 'ControlLeft' }, { sym: 0x0076, code: 'KeyV' }]);
+    toast('Pasted from device clipboard');
+  }
+});
+
+// Intercept copy/cut on page to sync
+document.addEventListener('copy', () => setTimeout(pullBrowserClipboard, 50));
+document.addEventListener('cut', () => setTimeout(pullBrowserClipboard, 50));
+
+// Keyboard hook for Ctrl+V / Cmd+V to proactively sync
+window.addEventListener('keydown', async (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+    pullBrowserClipboard();
+  }
 });
 
 el('full').addEventListener('click', () => {
