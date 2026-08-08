@@ -6,66 +6,281 @@
 <title>rvnc</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%232a6df4'/><rect x='3' y='4.5' width='10' height='7' rx='1' fill='%23fff'/></svg>">
 <style>
-  :root { color-scheme: dark; }
-  html, body { margin: 0; height: 100%; background: #14161a; color: #e6e8ec;
-               font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  #screen { width: 100%; height: 100%; overflow: hidden; }
-  #bar { position: fixed; inset: 0 0 auto 0; display: flex; gap: .5rem; align-items: center;
-         padding: .35rem .6rem; background: #1d2026e6; border-bottom: 1px solid #2b2f38;
-         backdrop-filter: blur(6px); transform: translateY(-100%); transition: transform .15s;
-         z-index: 10; }
-  #bar.show, #bar:hover, #bar:focus-within { transform: none; }
-  #peek { position: fixed; top: 0; left: 0; right: 0; height: 8px; z-index: 9; }
-  #status { flex: 1; color: #9aa3b2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  button { background: #2a2f3a; color: inherit; border: 1px solid #3a4150; border-radius: 6px;
-           padding: .25rem .6rem; font: inherit; cursor: pointer; }
-  button:hover { background: #343b49; }
-  #login { position: fixed; inset: 0; display: none; place-items: center; background: #14161a; z-index: 20; }
-  #login form { display: grid; gap: .75rem; width: min(20rem, 90vw); }
-  #login h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
-  input { background: #1d2026; color: inherit; border: 1px solid #3a4150; border-radius: 6px;
-          padding: .5rem .6rem; font: inherit; }
-  #error { color: #ff8f8f; min-height: 1.2em; }
-  #clipboard { position: fixed; inset: 0; display: none; place-items: center;
-               background: #05070ac9; z-index: 15; }
-  #clipboard > div { display: grid; gap: .6rem; width: min(34rem, 92vw);
-                     background: #1d2026; border: 1px solid #3a4150;
-                     border-radius: 10px; padding: 1rem; }
-  #clipboard h1 { margin: 0; font-size: 1rem; }
-  #clipboard p { margin: 0; color: #9aa3b2; font-size: .85rem; }
-  textarea { background: #14161a; color: inherit; border: 1px solid #3a4150;
-             border-radius: 6px; padding: .5rem; font: 13px/1.5 ui-monospace, monospace;
-             resize: vertical; }
+  :root {
+    color-scheme: dark;
+    --bg-dark: #0f1115;
+    --card-bg: rgba(26, 29, 36, 0.88);
+    --border: rgba(255, 255, 255, 0.12);
+    --border-hover: rgba(255, 255, 255, 0.25);
+    --primary: #2a6df4;
+    --primary-hover: #3b7af7;
+    --text: #f0f2f5;
+    --text-muted: #9aa3b2;
+    --danger: #ff5c5c;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg-dark);
+    color: var(--text);
+    font: 13px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+  }
+  #screen { width: 100%; height: 100%; overflow: hidden; display: flex; place-items: center; justify-content: center; }
+
+  /* Floating glass bar */
+  #bar {
+    position: fixed;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-150%);
+    display: flex;
+    gap: .4rem;
+    align-items: center;
+    padding: .4rem .7rem;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(14px);
+    transition: transform .22s cubic-bezier(0.16, 1, 0.3, 1), opacity .2s ease;
+    z-index: 50;
+    max-width: 96vw;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+  #bar.show, #bar:hover, #bar:focus-within {
+    transform: translateX(-50%) translateY(0);
+  }
+  #peek {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 14px;
+    z-index: 49;
+  }
+
+  .brand {
+    font-weight: 700;
+    font-size: .95rem;
+    letter-spacing: .5px;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+    margin-right: .3rem;
+  }
+  .brand svg { width: 15px; height: 15px; fill: var(--primary); }
+  #status {
+    color: var(--text-muted);
+    font-size: .8rem;
+    margin-right: .4rem;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: .35rem;
+  }
+  #status-indicator {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #ffaa00;
+  }
+  #status-indicator.online { background: #10b981; box-shadow: 0 0 6px #10b98188; }
+  #status-indicator.offline { background: var(--danger); }
+
+  .divider { width: 1px; height: 18px; background: var(--border); margin: 0 .2rem; }
+
+  button, .btn {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: .28rem .55rem;
+    font: inherit;
+    font-size: .82rem;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background .12s, border-color .12s, transform .08s;
+    display: inline-flex;
+    align-items: center;
+    gap: .3rem;
+  }
+  button:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: var(--border-hover);
+  }
+  button:active { transform: scale(0.97); }
+  button.primary {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+  }
+  button.primary:hover { background: var(--primary-hover); }
+
+  /* Modals */
+  .modal {
+    position: fixed;
+    inset: 0;
+    display: none;
+    place-items: center;
+    background: rgba(0, 0, 0, 0.65);
+    backdrop-filter: blur(8px);
+    z-index: 100;
+    padding: 1rem;
+  }
+  .modal > div {
+    display: grid;
+    gap: .8rem;
+    width: min(34rem, 94vw);
+    background: #181b22;
+    border: 1px solid var(--border-hover);
+    border-radius: 14px;
+    padding: 1.25rem;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+    animation: popIn .18s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes popIn {
+    from { transform: scale(0.95); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
+  .modal h1 { margin: 0; font-size: 1.15rem; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+  .modal p { margin: 0; color: var(--text-muted); font-size: .85rem; }
+
+  input, textarea {
+    background: #101217;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: .6rem .75rem;
+    font: inherit;
+    outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input:focus, textarea:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(42, 109, 244, 0.25);
+  }
+  textarea {
+    font: 12.5px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+    resize: vertical;
+  }
+  #error { color: var(--danger); font-size: .85rem; min-height: 1.2em; }
+
+  /* Mobile virtual keyboard proxy */
+  #key-proxy {
+    position: fixed;
+    top: -100px;
+    left: 0;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* Stats card */
+  #stats-panel {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: .5rem;
+    font-size: .85rem;
+  }
+  .stat-box {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: .5rem .75rem;
+  }
+  .stat-label { color: var(--text-muted); font-size: .75rem; }
+  .stat-val { font-weight: 600; font-size: 1rem; color: #fff; margin-top: .15rem; }
 </style>
 </head>
 <body>
 <div id="peek"></div>
+
 <div id="bar">
-  <strong>rvnc</strong>
-  <span id="status">connecting…</span>
-  <button id="cad" title="Send Ctrl+Alt+Delete">Ctrl+Alt+Del</button>
-  <button id="mode" title="Resize the desktop to the window, or scale it to fit">Mode: resize</button>
-  <button id="clip" title="Clipboard">Clipboard</button>
+  <div class="brand">
+    <svg viewBox="0 0 16 16"><rect width="16" height="16" rx="3"/><rect x="3" y="4.5" width="10" height="7" rx="1" fill="#fff"/></svg>
+    rvnc
+  </div>
+  <div id="status"><span id="status-indicator"></span><span id="status-text">connecting…</span></div>
+
+  <div class="divider"></div>
+
+  <button id="btn-cad" title="Ctrl+Alt+Delete">Ctrl+Alt+Del</button>
+  <button id="btn-win" title="Super / Windows Key">Win</button>
+  <button id="btn-alttab" title="Alt+Tab">Alt+Tab</button>
+  <button id="btn-esc" title="Escape">Esc</button>
+  <button id="btn-ctrlc" title="Copy (Ctrl+C)">Ctrl+C</button>
+  <button id="btn-ctrlv" title="Paste (Ctrl+V)">Ctrl+V</button>
+
+  <div class="divider"></div>
+
+  <button id="mode" title="Toggle Resize vs Scale">Mode: resize</button>
+  <button id="clip" title="Shared Clipboard">Clipboard</button>
+  <button id="btn-stats" title="Connection Statistics">Stats</button>
+  <button id="btn-kbd" title="Toggle Mobile Keyboard">Keyboard</button>
   <button id="full" title="Fullscreen">Fullscreen</button>
 </div>
-<div id="screen"></div>
 
-<div id="clipboard">
+<div id="screen"></div>
+<input id="key-proxy" type="text" autocomplete="off" autocapitalize="off" spellcheck="false">
+
+<!-- Clipboard Modal -->
+<div id="clipboard" class="modal">
   <div>
-    <h1>Clipboard</h1>
-    <p>Shared with the desktop. Editing this sends it across.</p>
+    <h1>
+      Clipboard
+      <span id="clip-count" style="font-size: .8rem; color: var(--text-muted); font-weight: 400;">0 chars</span>
+    </h1>
+    <p>Synchronized with the remote desktop. Edits made here send directly across.</p>
     <textarea id="cliptext" rows="8" spellcheck="false"></textarea>
-    <button id="clipclose">Close</button>
+    <div style="display: flex; justify-content: flex-end; gap: .5rem;">
+      <button id="clipcopy">Copy to Device</button>
+      <button id="clipclose" class="primary">Close</button>
+    </div>
   </div>
 </div>
 
-<div id="login">
-  <form id="loginform">
-    <h1>Password required</h1>
-    <input id="password" type="password" autocomplete="current-password" autofocus>
-    <button type="submit">Connect</button>
-    <div id="error"></div>
-  </form>
+<!-- Stats Modal -->
+<div id="stats" class="modal">
+  <div>
+    <h1>Connection Stats</h1>
+    <div id="stats-panel">
+      <div class="stat-box">
+        <div class="stat-label">Status</div>
+        <div id="stat-state" class="stat-val">Connecting</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Resolution</div>
+        <div id="stat-res" class="stat-val">-- x --</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Scaling Mode</div>
+        <div id="stat-mode" class="stat-val">Resize</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Security / Auth</div>
+        <div id="stat-auth" class="stat-val">Encrypted WS</div>
+      </div>
+    </div>
+    <div style="display: flex; justify-content: flex-end;">
+      <button id="statsclose" class="primary">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Login Modal -->
+<div id="login" class="modal">
+  <div>
+    <form id="loginform" style="display: grid; gap: .75rem;">
+      <h1>Password Required</h1>
+      <p>Enter the VNC session password to connect.</p>
+      <input id="password" type="password" autocomplete="current-password" placeholder="Enter password…" autofocus>
+      <button type="submit" class="primary" style="justify-content: center; padding: .55rem;">Connect to Desktop</button>
+      <div id="error"></div>
+    </form>
+  </div>
 </div>
 
 <script type="module">
@@ -74,49 +289,60 @@ import * as Log from './novnc/core/util/logging.js';
 
 const params = new URLSearchParams(location.search);
 if (params.get('debug')) Log.initLogging('debug');
+
 const el = (id) => document.getElementById(id);
-const status = el('status');
+const statusText = el('status-text');
+const statusInd = el('status-indicator');
 const bar = el('bar');
 let rfb = null;
-// "resize" makes the desktop adopt the window size, so fullscreen gives the
-// real screen resolution instead of a scaled-up smaller one.
 let mode = params.get('mode') === 'scale' ? 'scale' : 'resize';
 let lastClipboard = '';
 
 function url() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  // Relative to the directory this page was served from, so rvnc works
-  // behind a reverse proxy that mounts it on a subpath such as /vnc/.
   const base = location.pathname.replace(/[^/]*$/, '');
   return `${proto}://${location.host}${base}websockify`;
 }
 
-function say(text, sticky) {
-  status.textContent = text;
+function say(text, state = 'warn', sticky = false) {
+  statusText.textContent = text;
+  statusInd.className = state === 'online' ? 'online' : (state === 'offline' ? 'offline' : '');
   bar.classList.add('show');
   if (!sticky) setTimeout(() => bar.classList.remove('show'), 2500);
 }
 
+function updateStats() {
+  if (!rfb) return;
+  el('stat-state').textContent = rfb._rfbConnectionState || 'Connected';
+  if (rfb._fbWidth && rfb._fbHeight) {
+    el('stat-res').textContent = `${rfb._fbWidth} x ${rfb._fbHeight}`;
+  }
+  el('stat-mode').textContent = mode === 'resize' ? 'Dynamic Resize' : 'Scaled to Window';
+  el('stat-auth').textContent = location.protocol === 'https:' ? 'WSS (Secure)' : 'WS (Standard)';
+}
+
 function connect(password) {
   el('login').style.display = 'none';
-  say('connecting…', true);
+  say('connecting…', 'pending', true);
 
   rfb = new RFB(el('screen'), url(), { credentials: password ? { password } : {} });
   applyMode();
   rfb.showDotCursor = true;
 
-  // Desktop -> browser.
+  // Desktop -> browser clipboard
   rfb.addEventListener('clipboard', (e) => {
     lastClipboard = e.detail.text;
     el('cliptext').value = lastClipboard;
+    el('clip-count').textContent = `${lastClipboard.length} chars`;
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(lastClipboard).catch(() => {});
     }
   });
 
   rfb.addEventListener('connect', () => {
-    say('connected');
+    say('connected', 'online', false);
     document.title = rfb.desktopName || 'rvnc';
+    updateStats();
   });
 
   rfb.addEventListener('credentialsrequired', () => {
@@ -129,13 +355,8 @@ function connect(password) {
 
   rfb.addEventListener('disconnect', (e) => {
     rfb = null;
-    if (e.detail.clean) {
-      say('disconnected — reconnecting…', true);
-      setTimeout(() => connect(password), 1000);
-    } else {
-      say('connection lost — retrying…', true);
-      setTimeout(() => connect(password), 2000);
-    }
+    say(e.detail.clean ? 'disconnected — reconnecting…' : 'connection lost — retrying…', 'offline', true);
+    setTimeout(() => connect(password), e.detail.clean ? 1000 : 2000);
   });
 }
 
@@ -153,7 +374,44 @@ el('loginform').addEventListener('submit', (e) => {
   connect(value);
 });
 
-el('cad').addEventListener('click', () => rfb && rfb.sendCtrlAltDel());
+// Quick shortcut keys
+el('btn-cad').addEventListener('click', () => rfb && rfb.sendCtrlAltDel());
+
+function sendKeyCombo(keys) {
+  if (!rfb) return;
+  for (const k of keys) rfb.sendKey(k.sym, k.code, true);
+  for (const k of [...keys].reverse()) rfb.sendKey(k.sym, k.code, false);
+}
+
+el('btn-win').addEventListener('click', () => {
+  sendKeyCombo([{ sym: 0xffeb, code: 'MetaLeft' }]);
+});
+
+el('btn-alttab').addEventListener('click', () => {
+  if (!rfb) return;
+  rfb.sendKey(0xffe9, 'AltLeft', true);
+  rfb.sendKey(0xff09, 'Tab', true);
+  rfb.sendKey(0xff09, 'Tab', false);
+  rfb.sendKey(0xffe9, 'AltLeft', false);
+});
+
+el('btn-esc').addEventListener('click', () => {
+  sendKeyCombo([{ sym: 0xff1b, code: 'Escape' }]);
+});
+
+el('btn-ctrlc').addEventListener('click', () => {
+  sendKeyCombo([{ sym: 0xffe3, code: 'ControlLeft' }, { sym: 0x0063, code: 'KeyC' }]);
+});
+
+el('btn-ctrlv').addEventListener('click', () => {
+  sendKeyCombo([{ sym: 0xffe3, code: 'ControlLeft' }, { sym: 0x0076, code: 'KeyV' }]);
+});
+
+// On-screen / mobile keyboard trigger
+el('btn-kbd').addEventListener('click', () => {
+  const proxy = el('key-proxy');
+  proxy.focus();
+});
 
 function applyMode() {
   if (!rfb) return;
@@ -165,33 +423,49 @@ el('mode').addEventListener('click', () => {
   mode = mode === 'resize' ? 'scale' : 'resize';
   el('mode').textContent = `Mode: ${mode}`;
   applyMode();
+  updateStats();
 });
 
-// Browser -> desktop.
+// Browser -> desktop clipboard
 function sendClipboard(text) {
   if (!rfb || text === lastClipboard) return;
   lastClipboard = text;
+  el('clip-count').textContent = `${text.length} chars`;
   rfb.clipboardPasteFrom(text);
 }
 
 el('clip').addEventListener('click', () => {
   el('clipboard').style.display = 'grid';
+  el('cliptext').value = lastClipboard;
+  el('clip-count').textContent = `${lastClipboard.length} chars`;
   el('cliptext').focus();
 });
 el('clipclose').addEventListener('click', () => {
   el('clipboard').style.display = 'none';
 });
+el('clipcopy').addEventListener('click', () => {
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(el('cliptext').value);
+  }
+});
 el('cliptext').addEventListener('input', (e) => sendClipboard(e.target.value));
 
-// Whenever the page regains focus, pick up whatever was copied outside it.
-// Needs a secure context (https or localhost) and the user's permission; the
-// Clipboard panel above is the fallback when that is refused.
+// Stats modal
+el('btn-stats').addEventListener('click', () => {
+  updateStats();
+  el('stats').style.display = 'grid';
+});
+el('statsclose').addEventListener('click', () => {
+  el('stats').style.display = 'none';
+});
+
+// Auto-clipboard sync on focus & paste
 async function pullBrowserClipboard() {
   if (!navigator.clipboard || !navigator.clipboard.readText) return;
   try {
     const text = await navigator.clipboard.readText();
     if (text) sendClipboard(text);
-  } catch (_) { /* not permitted, use the panel */ }
+  } catch (_) {}
 }
 window.addEventListener('focus', pullBrowserClipboard);
 document.addEventListener('paste', (e) => {

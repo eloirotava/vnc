@@ -17,7 +17,6 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
-use crate::http::log;
 use crate::x11::XResult;
 
 /// Ignore anything larger than this; clipboards that big are a mistake.
@@ -31,6 +30,27 @@ struct Atoms {
     text: Atom,
     incr: Atom,
     property: Atom,
+}
+
+impl Atoms {
+    /// How to answer a selection request for `target`: the type to label the
+    /// property with, and the bytes to put in it. `None` means we have nothing
+    /// in that format.
+    ///
+    /// `STRING` is Latin-1 by the ICCCM, so it cannot carry the UTF-8 encoding
+    /// of the same text — handing over UTF-8 bytes there is what turns "á"
+    /// into "Ã¡" in the program doing the paste.
+    fn encode(&self, target: Atom, text: &str) -> Option<(Atom, Vec<u8>)> {
+        if target == self.utf8_string || target == self.text {
+            // TEXT leaves the encoding to the owner, so answer UTF-8 and say
+            // so in the property type.
+            Some((self.utf8_string, text.as_bytes().to_vec()))
+        } else if target == Atom::from(AtomEnum::STRING) {
+            Some((target, to_latin1(text)))
+        } else {
+            None
+        }
+    }
 }
 
 pub struct Clipboard {
@@ -155,14 +175,57 @@ impl Clipboard {
             .reply()?;
 
         if reply.type_ == self.atoms.incr {
-            // Huge selections arrive in chunks; not worth supporting.
-            log::debug("clipboard: ignoring an INCR transfer");
-            return Ok(None);
+            return self.read_incr();
         }
         if reply.value.is_empty() {
             return Ok(None);
         }
         Ok(Some(String::from_utf8_lossy(&reply.value).into_owned()))
+    }
+
+    fn read_incr(&self) -> XResult<Option<String>> {
+        let mut data = Vec::new();
+        // Acknowledge the start of the INCR transfer by deleting the property.
+        self.conn.delete_property(self.window, self.atoms.property)?;
+        self.conn.flush()?;
+
+        loop {
+            let event = self.conn.wait_for_event()?;
+            match event {
+                Event::PropertyNotify(e)
+                    if e.window == self.window
+                        && e.atom == self.atoms.property
+                        && e.state == xproto::Property::NEW_VALUE =>
+                {
+                    let chunk = self
+                        .conn
+                        .get_property(
+                            true,
+                            self.window,
+                            self.atoms.property,
+                            AtomEnum::ANY,
+                            0,
+                            (MAX_TEXT / 4) as u32,
+                        )?
+                        .reply()?;
+                    if chunk.value.is_empty() {
+                        break;
+                    }
+                    if data.len() + chunk.value.len() <= MAX_TEXT {
+                        data.extend_from_slice(&chunk.value);
+                    }
+                }
+                Event::SelectionClear(_) => {
+                    self.ours.lock().unwrap().clear();
+                }
+                _ => {}
+            }
+        }
+        if data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(String::from_utf8_lossy(&data).into_owned()))
+        }
     }
 
     /// Hand our text to a program on the display that asked for it.
@@ -186,20 +249,20 @@ impl Clipboard {
                 AtomEnum::ATOM,
                 &targets,
             )?;
-        } else if req.target == self.atoms.utf8_string
-            || req.target == self.atoms.text
-            || req.target == Atom::from(AtomEnum::STRING)
-        {
-            let text = self.ours.lock().unwrap().clone();
-            self.conn.change_property8(
-                PropMode::REPLACE,
-                req.requestor,
-                property,
-                req.target,
-                text.as_bytes(),
-            )?;
         } else {
-            property = x11rb::NONE; // we cannot provide that format
+            let text = self.ours.lock().unwrap().clone();
+            match self.atoms.encode(req.target, &text) {
+                Some((type_, bytes)) => {
+                    self.conn.change_property8(
+                        PropMode::REPLACE,
+                        req.requestor,
+                        property,
+                        type_,
+                        &bytes,
+                    )?;
+                }
+                None => property = x11rb::NONE, // we cannot provide that format
+            }
         }
 
         let event = SelectionNotifyEvent {
@@ -250,6 +313,45 @@ mod tests {
     fn latin1_is_byte_for_byte_for_ascii() {
         assert_eq!(to_latin1("hello"), b"hello");
         assert_eq!(from_latin1(b"hello"), "hello");
+    }
+
+    /// Atom numbers are assigned by the server; any distinct values will do,
+    /// as long as none collides with the predefined STRING (31).
+    fn atoms() -> Atoms {
+        Atoms {
+            clipboard: 100,
+            primary: 1,
+            targets: 101,
+            utf8_string: 102,
+            text: 103,
+            incr: 104,
+            property: 105,
+        }
+    }
+
+    #[test]
+    fn string_target_gets_latin1_not_utf8() {
+        let a = atoms();
+        let string = Atom::from(AtomEnum::STRING);
+        let (type_, bytes) = a.encode(string, "Olá").unwrap();
+        assert_eq!(type_, string);
+        // Latin-1: one byte for the accented letter, not UTF-8's two.
+        assert_eq!(bytes, vec![b'O', b'l', 0xE1]);
+    }
+
+    #[test]
+    fn utf8_and_text_targets_get_utf8_labelled_as_such() {
+        let a = atoms();
+        for target in [a.utf8_string, a.text] {
+            let (type_, bytes) = a.encode(target, "Olá").unwrap();
+            assert_eq!(type_, a.utf8_string, "TEXT must say which encoding it used");
+            assert_eq!(bytes, "Olá".as_bytes());
+        }
+    }
+
+    #[test]
+    fn unknown_targets_are_refused() {
+        assert!(atoms().encode(999, "hi").is_none());
     }
 
     #[test]

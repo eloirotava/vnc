@@ -190,7 +190,7 @@ fn serve(args: &Args, sup: &Arc<Supervisor>) -> Result<(), Fail> {
                 .name("clipboard".into())
                 .spawn(move || {
                     let result = runner.run(move |text| {
-                        let bytes = Arc::new(clipboard::to_latin1(&text));
+                        let bytes = Arc::new(text.into_bytes());
                         hub_for_clipboard.broadcast_clipboard(bytes, None);
                     });
                     if let Err(e) = result {

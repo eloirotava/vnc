@@ -23,11 +23,24 @@ const MSG_CLIENT_CUT_TEXT: u8 = 6;
 const MSG_SET_DESKTOP_SIZE: u8 = 251;
 
 const ENC_RAW: i32 = 0;
+const ENC_COPYRECT: i32 = 1;
 const ENC_ZRLE: i32 = 16;
 const ENC_CURSOR: i32 = -239;
 const ENC_LAST_RECT: i32 = -224;
 const ENC_DESKTOP_SIZE: i32 = -223;
 const ENC_EXT_DESKTOP_SIZE: i32 = -308;
+const ENC_EXT_CLIPBOARD: i32 = -1063131698; // 0xc0a1e5ce
+
+#[allow(dead_code)]
+const EXT_CLIP_ACTION_CAPS: u32 = 1 << 24;
+#[allow(dead_code)]
+const EXT_CLIP_ACTION_REQUEST: u32 = 1 << 25;
+#[allow(dead_code)]
+const EXT_CLIP_ACTION_PEEK: u32 = 1 << 26;
+#[allow(dead_code)]
+const EXT_CLIP_ACTION_NOTIFY: u32 = 1 << 27;
+const EXT_CLIP_ACTION_PROVIDE: u32 = 1 << 28;
+const EXT_CLIP_FORMAT_TEXT: u32 = 1;
 
 /// Guards against a client asking us to allocate unbounded memory.
 const MAX_ENCODINGS: u16 = 4096;
@@ -155,6 +168,8 @@ fn authenticate<R: Read, W: Write>(
         reader.read_exact(&mut response)?;
         let expected = auth::encrypt_challenge(cfg.password.as_ref().unwrap(), &challenge);
         if !auth::constant_time_eq(&response, &expected) {
+            // Delay failed attempts to protect against brute-force password guessing.
+            std::thread::sleep(std::time::Duration::from_millis(1000));
             let _ = fail_security(writer, minor, "authentication failed");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -224,6 +239,8 @@ fn read_loop<R: Read>(
                         ENC_LAST_RECT => caps.last_rect = true,
                         ENC_DESKTOP_SIZE => caps.desktop_size = true,
                         ENC_EXT_DESKTOP_SIZE => caps.ext_desktop_size = true,
+                        ENC_EXT_CLIPBOARD => caps.ext_clipboard = true,
+                        ENC_COPYRECT => caps.copy_rect = true,
                         _ => {}
                     }
                 }
@@ -275,25 +292,45 @@ fn read_loop<R: Read>(
             MSG_CLIENT_CUT_TEXT => {
                 let mut head = [0u8; 7];
                 reader.read_exact(&mut head)?;
-                let len = u32::from_be_bytes([head[3], head[4], head[5], head[6]]);
+                let raw_len = u32::from_be_bytes([head[3], head[4], head[5], head[6]]);
+                let is_extended = (raw_len as i32) < 0;
+                let len = if is_extended {
+                    (-(raw_len as i32)) as u32
+                } else {
+                    raw_len
+                };
                 if len > MAX_CUT_TEXT {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "oversized clipboard message",
                     ));
                 }
-                let mut text = vec![0u8; len as usize];
-                reader.read_exact(&mut text)?;
+                let mut payload = vec![0u8; len as usize];
+                reader.read_exact(&mut payload)?;
                 if !cfg.view_only {
-                    if let Some(clipboard) = &extras.clipboard {
-                        let decoded = crate::clipboard::from_latin1(&text);
-                        if let Err(e) = clipboard.set(decoded) {
-                            crate::http::log::debug(&format!("clipboard: {e}"));
+                    if is_extended && payload.len() >= 4 {
+                        let flags = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        let action = flags & 0xff00_0000;
+                        let formats = flags & 0x0000_ffff;
+                        if action & EXT_CLIP_ACTION_PROVIDE != 0 && formats & EXT_CLIP_FORMAT_TEXT != 0 {
+                            if let Some(text) = decompress_ext_clipboard(&payload[4..]) {
+                                if let Some(clipboard) = &extras.clipboard {
+                                    if let Err(e) = clipboard.set(text.clone()) {
+                                        crate::http::log::debug(&format!("clipboard: {e}"));
+                                    }
+                                }
+                                hub.broadcast_clipboard(Arc::new(text.into_bytes()), Some(link));
+                            }
                         }
+                    } else if !is_extended {
+                        let decoded = crate::clipboard::from_latin1(&payload);
+                        if let Some(clipboard) = &extras.clipboard {
+                            if let Err(e) = clipboard.set(decoded) {
+                                crate::http::log::debug(&format!("clipboard: {e}"));
+                            }
+                        }
+                        hub.broadcast_clipboard(Arc::new(payload), Some(link));
                     }
-                    // Keep other viewers in step; taking ownership ourselves
-                    // produces no XFIXES notification we would see.
-                    hub.broadcast_clipboard(Arc::new(text), Some(link));
                 }
             }
             MSG_SET_DESKTOP_SIZE => {
@@ -366,39 +403,42 @@ fn write_loop<W: Write>(
     let mut msg = Vec::new();
 
     loop {
-        let (pf, caps, rects, send_cursor, resize, clipboard) = {
+        let (pf, caps, mut rects, send_cursor, resize, clipboard, serve_update) = {
             let mut st = link.state.lock().unwrap();
             loop {
                 if st.closed {
                     return Ok(());
                 }
-                if st.clipboard.is_some() || st.pending_resize.is_some() {
-                    break;
-                }
-                let has_work = st.want_full || !st.dirty.is_empty() || st.cursor_dirty;
-                if st.want_update && has_work {
+                // Clipboard is a message of its own and needs no request; an
+                // update needs one, and needs something to put in it.
+                if st.clipboard.is_some() || (st.want_update && st.has_work()) {
                     break;
                 }
                 st = link.cv.wait(st).unwrap();
             }
-            let (w, h) = {
-                // The frame cannot change size while a session is running, so
-                // reading the dimensions from the tile map is enough.
-                hub.dimensions()
-            };
-            let rects = if st.want_full {
-                st.dirty.clear_all();
-                vec![Rect { x: 0, y: 0, w, h }]
+            // These dimensions are only a hint: the frame can be replaced
+            // again before we get to read it, so everything is clipped once
+            // more under the frame lock below.
+            let (w, h) = hub.dimensions();
+            let serve_update = st.want_update && st.has_work();
+            let (rects, send_cursor, resize) = if serve_update {
+                let rects = if st.want_full {
+                    st.dirty.clear_all();
+                    vec![Rect { x: 0, y: 0, w, h }]
+                } else {
+                    st.dirty.take_rects(w, h)
+                };
+                let send_cursor = st.cursor_dirty && st.caps.cursor;
+                let resize = st.pending_resize.take().filter(|_| st.caps.ext_desktop_size);
+                st.cursor_dirty = false;
+                st.want_update = false;
+                st.want_full = false;
+                (rects, send_cursor, resize)
             } else {
-                st.dirty.take_rects(w, h)
+                (Vec::new(), false, None)
             };
-            let send_cursor = st.cursor_dirty && st.caps.cursor;
-            let resize = st.pending_resize.take().filter(|_| st.caps.ext_desktop_size);
             let clipboard = st.clipboard.take();
-            st.cursor_dirty = false;
-            st.want_update = false;
-            st.want_full = false;
-            (st.pf, st.caps, rects, send_cursor, resize, clipboard)
+            (st.pf, st.caps, rects, send_cursor, resize, clipboard, serve_update)
         };
 
         if codec.format() != pf {
@@ -406,32 +446,56 @@ fn write_loop<W: Write>(
         }
 
         // Clipboard is its own message type, not part of an update.
-        if let Some(text) = clipboard {
-            let mut cut = Vec::with_capacity(8 + text.len());
-            cut.push(3); // ServerCutText
-            cut.extend_from_slice(&[0, 0, 0]);
-            cut.extend_from_slice(&(text.len() as u32).to_be_bytes());
-            cut.extend_from_slice(&text);
-            send(writer, &cut)?;
+        if let Some(text_bytes) = clipboard {
+            if caps.ext_clipboard {
+                if let Ok(cut) = encode_ext_clipboard_provide(&text_bytes) {
+                    send(writer, &cut)?;
+                }
+            } else {
+                let latin1 = crate::clipboard::to_latin1(&String::from_utf8_lossy(&text_bytes));
+                let mut cut = Vec::with_capacity(8 + latin1.len());
+                cut.push(3); // ServerCutText
+                cut.extend_from_slice(&[0, 0, 0]);
+                cut.extend_from_slice(&(latin1.len() as u32).to_be_bytes());
+                cut.extend_from_slice(&latin1);
+                send(writer, &cut)?;
+            }
         }
 
-        let (fb_width, fb_height) = hub.dimensions();
+        if !serve_update {
+            // Only the clipboard woke us. An update the client never asked
+            // for is not ours to send.
+            continue;
+        }
+
         msg.clear();
-        let count = rects.len() + send_cursor as usize + resize.is_some() as usize;
-        msg.push(0); // FramebufferUpdate
-        msg.push(0);
-        msg.extend_from_slice(&(count as u16).to_be_bytes());
-
-        if let Some(reason) = resize {
-            write_ext_desktop_size(&mut msg, reason, fb_width as u16, fb_height as u16);
-        }
-
-        if send_cursor {
-            write_cursor(&mut msg, hub, &codec);
-        }
-
-        if !rects.is_empty() {
+        {
+            // Hold the frame for the whole encode. The rectangles were
+            // measured before this lock, so a client that resized the desktop
+            // in between would otherwise leave us reading past the end of a
+            // smaller framebuffer.
             let frame = hub.frame.read().unwrap();
+            rects.retain_mut(|r| match r.clip(frame.width, frame.height) {
+                Some(clipped) => {
+                    *r = clipped;
+                    true
+                }
+                None => false,
+            });
+
+            let count = rects.len() + send_cursor as usize + resize.is_some() as usize;
+            msg.push(0); // FramebufferUpdate
+            msg.push(0);
+            msg.extend_from_slice(&(count as u16).to_be_bytes());
+
+            if let Some(reason) = resize {
+                write_ext_desktop_size(&mut msg, reason, frame.width as u16, frame.height as u16);
+            }
+
+            if send_cursor {
+                write_cursor(&mut msg, hub, &codec);
+            }
+
             for r in &rects {
                 msg.extend_from_slice(&(r.x as u16).to_be_bytes());
                 msg.extend_from_slice(&(r.y as u16).to_be_bytes());
@@ -447,10 +511,10 @@ fn write_loop<W: Write>(
                     }
                 }
             }
-        }
 
-        crate::http::log::debug(&format!(
-            "update: {} rect(s), {} bytes", count, msg.len()));
+            crate::http::log::debug(&format!(
+                "update: {} rect(s), {} bytes", count, msg.len()));
+        }
         send(writer, &msg)?;
     }
 }
@@ -516,5 +580,74 @@ fn write_cursor(msg: &mut Vec<u8>, hub: &Hub, codec: &PixCodec) {
             }
             msg.push(bits);
         }
+    }
+}
+
+fn decompress_ext_clipboard(data: &[u8]) -> Option<String> {
+    use flate2::Decompress;
+    let mut d = Decompress::new(true);
+    let mut plain = Vec::new();
+    let mut consumed = 0;
+    while consumed < data.len() {
+        if plain.capacity() - plain.len() < 1024 {
+            plain.reserve(4096);
+        }
+        let in0 = d.total_in();
+        let res = d.decompress_vec(&data[consumed..], &mut plain, flate2::FlushDecompress::None);
+        consumed += (d.total_in() - in0) as usize;
+        match res {
+            Ok(flate2::Status::StreamEnd) => break,
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    if plain.len() < 4 {
+        return None;
+    }
+    let text_len = u32::from_be_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
+    let text_bytes = &plain[4..4 + text_len.min(plain.len().saturating_sub(4))];
+    let text = String::from_utf8_lossy(text_bytes.strip_suffix(b"\0").unwrap_or(text_bytes)).into_owned();
+    Some(text)
+}
+
+fn encode_ext_clipboard_provide(text_bytes: &[u8]) -> io::Result<Vec<u8>> {
+    use flate2::{Compress, Compression, FlushCompress};
+    let mut raw = Vec::with_capacity(4 + text_bytes.len() + 1);
+    raw.extend_from_slice(&((text_bytes.len() + 1) as u32).to_be_bytes());
+    raw.extend_from_slice(text_bytes);
+    raw.push(0); // null terminator
+
+    let mut comp = Compress::new(Compression::new(1), true);
+    let mut zdata = Vec::with_capacity(raw.len() + 64);
+    comp.compress_vec(&raw, &mut zdata, FlushCompress::Finish)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    let total_len = 4 + zdata.len();
+    let mut cut = Vec::with_capacity(8 + total_len);
+    cut.push(3); // ServerCutText
+    cut.extend_from_slice(&[0, 0, 0]);
+    cut.extend_from_slice(&(-(total_len as i32)).to_be_bytes());
+    let flags = EXT_CLIP_ACTION_PROVIDE | EXT_CLIP_FORMAT_TEXT;
+    cut.extend_from_slice(&flags.to_be_bytes());
+    cut.extend_from_slice(&zdata);
+    Ok(cut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ext_clipboard_roundtrips_unicode_and_emojis() {
+        let text = "🚀 Olá Mundo! 日本語 CJK & Unicode test 🌟";
+        let packet = encode_ext_clipboard_provide(text.as_bytes()).unwrap();
+        assert_eq!(packet[0], 3); // ServerCutText
+        let raw_len = i32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        assert!(raw_len < 0, "ExtendedClipboard must use negative length");
+        let flags = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+        assert_eq!(flags, EXT_CLIP_ACTION_PROVIDE | EXT_CLIP_FORMAT_TEXT);
+
+        let decoded = decompress_ext_clipboard(&packet[12..]).unwrap();
+        assert_eq!(decoded, text);
     }
 }

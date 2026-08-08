@@ -18,6 +18,22 @@ pub struct Rect {
     pub h: u32,
 }
 
+impl Rect {
+    /// Trim to a `width` x `height` screen, or `None` when nothing is left.
+    ///
+    /// A rectangle can outlive the frame it was measured against: a client
+    /// resizing the desktop replaces the framebuffer, and anything already in
+    /// flight then describes a screen that no longer exists.
+    pub fn clip(self, width: u32, height: u32) -> Option<Rect> {
+        if self.x >= width || self.y >= height {
+            return None;
+        }
+        let w = self.w.min(width - self.x);
+        let h = self.h.min(height - self.y);
+        (w > 0 && h > 0).then_some(Rect { x: self.x, y: self.y, w, h })
+    }
+}
+
 /// The captured screen, one `u32` per pixel in `0x00RRGGBB`.
 pub struct Frame {
     pub width: u32,
@@ -166,6 +182,12 @@ impl TileMap {
 
                 let x = start * TILE;
                 let y = row * TILE;
+                // The map can describe more tiles than the screen still has,
+                // because a resize replaces the framebuffer before it reaches
+                // every client. Those tiles have nothing left to send.
+                if x >= width || y >= height {
+                    continue;
+                }
                 let w = (end * TILE).min(width) - x;
                 let h = ((last_row + 1) * TILE).min(height) - y;
                 out.push(Rect { x, y, w, h });
@@ -194,6 +216,19 @@ pub struct LinkState {
     pub clipboard: Option<Arc<Vec<u8>>>,
 }
 
+impl LinkState {
+    /// Whether a `FramebufferUpdate` would carry anything at all. Pending
+    /// cursor and resize rectangles only count when the client asked for
+    /// those pseudo-encodings, otherwise they would wake the writer for a
+    /// message it cannot send.
+    pub fn has_work(&self) -> bool {
+        self.want_full
+            || !self.dirty.is_empty()
+            || (self.cursor_dirty && self.caps.cursor)
+            || (self.pending_resize.is_some() && self.caps.ext_desktop_size)
+    }
+}
+
 /// Which encodings the client asked for.
 #[derive(Clone, Copy, Debug)]
 #[derive(Default)]
@@ -203,6 +238,8 @@ pub struct Caps {
     pub last_rect: bool,
     pub desktop_size: bool,
     pub ext_desktop_size: bool,
+    pub ext_clipboard: bool,
+    pub copy_rect: bool,
 }
 
 pub struct ClientLink {
@@ -387,6 +424,55 @@ mod tests {
         let rects = t.take_rects(640, 480);
         assert_eq!(rects.len(), 2);
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn clipping_trims_and_drops_rects_a_resize_left_behind() {
+        let r = Rect { x: 0, y: 0, w: 1440, h: 900 };
+        assert_eq!(r.clip(800, 600), Some(Rect { x: 0, y: 0, w: 800, h: 600 }));
+        // Wholly outside the new screen: nothing to send.
+        assert_eq!(Rect { x: 1024, y: 0, w: 64, h: 64 }.clip(800, 600), None);
+        assert_eq!(Rect { x: 0, y: 768, w: 64, h: 64 }.clip(800, 600), None);
+        // Already inside: untouched.
+        assert_eq!(r.clip(1920, 1200), Some(r));
+    }
+
+    #[test]
+    fn tiles_beyond_a_shrunken_screen_are_dropped_not_wrapped() {
+        // The map still describes 1440x900 while the screen is down to
+        // 800x600, which is exactly what a client resize leaves behind.
+        let mut t = TileMap::new(1440, 900);
+        t.set_all();
+        let rects = t.take_rects(800, 600);
+        assert!(t.is_empty(), "every tile must still be consumed");
+        for r in &rects {
+            assert!(r.w > 0 && r.h > 0, "{r:?} has no area");
+            assert!(
+                r.x + r.w <= 800 && r.y + r.h <= 600,
+                "{r:?} runs past the 800x600 screen"
+            );
+        }
+        assert!(!rects.is_empty());
+    }
+
+    #[test]
+    fn work_only_counts_what_the_client_can_receive() {
+        let hub = Hub::new(320, 240);
+        let link = hub.register();
+        let mut st = link.state.lock().unwrap();
+        st.dirty.clear_all();
+        st.cursor_dirty = false;
+        st.pending_resize = None;
+        assert!(!st.has_work());
+
+        // Without the matching pseudo-encodings these would wake the writer
+        // for a message it cannot put on the wire.
+        st.cursor_dirty = true;
+        st.pending_resize = Some(0);
+        assert!(!st.has_work());
+
+        st.caps.cursor = true;
+        assert!(st.has_work());
     }
 
     #[test]

@@ -203,14 +203,16 @@ fn upgrade_websocket(
 }
 
 fn serve_static(stream: TcpStream, req: &Request) -> io::Result<()> {
+    // HEAD gets exactly the headers GET would return, and no body.
+    let body = req.method != "HEAD";
     let path = req.path.split(['?', '#']).next().unwrap_or("/");
     let rel = if path == "/" { "index.html" } else { path.trim_start_matches('/') };
     if rel.contains("..") {
-        return respond(stream, 400, "text/plain", b"bad path");
+        return write_response(stream, 400, "text/plain", b"bad path", body);
     }
     match WEB.get_file(rel) {
-        Some(file) => respond(stream, 200, content_type(rel), file.contents()),
-        None => respond(stream, 404, "text/plain", b"not found"),
+        Some(file) => write_response(stream, 200, content_type(rel), file.contents(), body),
+        None => write_response(stream, 404, "text/plain", b"not found", body),
     }
 }
 
@@ -228,7 +230,19 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
-fn respond(mut stream: TcpStream, status: u16, ctype: &str, body: &[u8]) -> io::Result<()> {
+fn respond(stream: TcpStream, status: u16, ctype: &str, body: &[u8]) -> io::Result<()> {
+    write_response(stream, status, ctype, body, true)
+}
+
+/// `send_body` is false for HEAD: the headers still describe the body that a
+/// GET would return, but none of it goes on the wire.
+fn write_response<W: Write>(
+    mut stream: W,
+    status: u16,
+    ctype: &str,
+    body: &[u8],
+    send_body: bool,
+) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -246,7 +260,9 @@ fn respond(mut stream: TcpStream, status: u16, ctype: &str, body: &[u8]) -> io::
         body.len()
     );
     stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
+    if send_body {
+        stream.write_all(body)?;
+    }
     stream.flush()
 }
 
@@ -346,6 +362,27 @@ mod tests {
         assert!(WEB.get_file("index.html").is_some());
         assert!(WEB.get_file("novnc/core/rfb.js").is_some());
         assert!(WEB.get_file("../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn head_sends_the_headers_of_a_get_but_no_body() {
+        let mut get = Vec::new();
+        write_response(&mut get, 200, "text/html", b"<html>", true).unwrap();
+        let mut head = Vec::new();
+        write_response(&mut head, 200, "text/html", b"<html>", false).unwrap();
+
+        let split = |v: &[u8]| {
+            let text = String::from_utf8(v.to_vec()).unwrap();
+            let (h, b) = text.split_once("\r\n\r\n").unwrap();
+            (h.to_string(), b.to_string())
+        };
+        let (get_head, get_body) = split(&get);
+        let (head_head, head_body) = split(&head);
+
+        assert_eq!(get_head, head_head, "HEAD must describe the same response");
+        assert!(get_head.contains("Content-Length: 6"));
+        assert_eq!(get_body, "<html>");
+        assert_eq!(head_body, "", "HEAD must not carry a body");
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
+use x11rb::errors::ReplyError;
 use x11rb::protocol::damage::{self, ConnectionExt as _};
 use x11rb::protocol::randr::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
@@ -20,6 +21,19 @@ use crate::http::log;
 use crate::screen::{CursorImage, Frame, Hub, Rect};
 
 pub type XResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Outcome of a screen grab.
+///
+/// Resizing is the one thing that reliably makes `GetImage` fail: the request
+/// is built from rvnc's idea of the screen size, and another thread can change
+/// the real one in between. That arrives as a protocol error rather than a
+/// broken connection, and it must not be fatal — a desktop that disappears
+/// because its window was resized is worse than a dropped frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grab {
+    Done,
+    Raced,
+}
 
 /// How the X server lays out pixels in `GetImage` replies.
 #[derive(Clone, Copy)]
@@ -192,10 +206,19 @@ impl Capture {
         self.height = height;
     }
 
+    /// Re-read the root window's real size, taking the X server's word for it
+    /// after a grab raced a resize.
+    pub fn resync_size(&mut self) -> XResult<(u16, u16)> {
+        let geom = self.conn.get_geometry(self.root)?.reply()?;
+        self.width = geom.width;
+        self.height = geom.height;
+        Ok((self.width, self.height))
+    }
+
     /// Read one rectangle of the screen into `frame`. The rectangle is
     /// clipped to the screen, which can shrink under us when a client asks
     /// for a different resolution.
-    pub fn grab(&self, frame: &mut Frame, r: Rect) -> XResult<()> {
+    pub fn grab(&self, frame: &mut Frame, r: Rect) -> XResult<Grab> {
         let r = Rect {
             x: r.x.min(self.width as u32),
             y: r.y.min(self.height as u32),
@@ -208,26 +231,40 @@ impl Capture {
             ..r
         };
         if r.w == 0 || r.h == 0 {
-            return Ok(());
+            return Ok(Grab::Done);
         }
-        let reply = self
-            .conn
-            .get_image(
-                ImageFormat::Z_PIXMAP,
-                self.root,
-                r.x as i16,
-                r.y as i16,
-                r.w as u16,
-                r.h as u16,
-                u32::MAX,
-            )?
-            .reply()?;
+        let cookie = self.conn.get_image(
+            ImageFormat::Z_PIXMAP,
+            self.root,
+            r.x as i16,
+            r.y as i16,
+            r.w as u16,
+            r.h as u16,
+            u32::MAX,
+        )?;
+        let reply = match cookie.reply() {
+            Ok(reply) => reply,
+            // The screen shrank between the clip above and this request, so
+            // the rectangle is no longer inside the root. Recoverable: the
+            // caller re-reads the size and starts over.
+            Err(ReplyError::X11Error(e)) => {
+                log::debug(&format!(
+                    "GetImage refused ({:?}): the screen moved under us",
+                    e.error_kind
+                ));
+                return Ok(Grab::Raced);
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         let bpp = self.fmt.bits_per_pixel as usize;
         let pad = self.fmt.scanline_pad as usize;
         let stride = ((r.w as usize * bpp + pad - 1) / pad) * (pad / 8);
         if reply.data.len() < stride * r.h as usize {
-            return Err("short GetImage reply".into());
+            // Same story, but the server answered before noticing. Never fatal
+            // enough to be worth taking the whole desktop down for.
+            log::warn("short GetImage reply; re-reading the screen size");
+            return Ok(Grab::Raced);
         }
 
         for row in 0..r.h {
@@ -236,7 +273,7 @@ impl Capture {
             let dst = &mut frame.px[dst_start..dst_start + r.w as usize];
             self.convert_row(src, dst);
         }
-        Ok(())
+        Ok(Grab::Done)
     }
 
     #[inline]
@@ -320,15 +357,14 @@ pub fn run_capture(mut cap: Capture, hub: Arc<Hub>, max_fps: u32) -> XResult<()>
     let mut full = cap.full_rect();
 
     // Prime the framebuffer and the cursor.
-    {
+    let mut stale = {
         let mut frame = hub.frame.write().unwrap();
-        cap.grab(&mut frame, full)?;
-    }
+        cap.grab(&mut frame, full)? == Grab::Raced
+    };
     if let Ok(Some(c)) = cap.cursor() {
         hub.set_cursor(Some(Arc::new(c)));
     }
 
-    let mut stale = false;
     loop {
         let started = Instant::now();
 
@@ -394,12 +430,28 @@ pub fn run_capture(mut cap: Capture, hub: Arc<Hub>, max_fps: u32) -> XResult<()>
 
         if !rects.is_empty() {
             log::debug(&format!("capture: {} rect(s), first {:?}", rects.len(), rects[0]));
-            let mut frame = hub.frame.write().unwrap();
-            for r in &rects {
-                cap.grab(&mut frame, *r)?;
+            let mut raced = false;
+            {
+                let mut frame = hub.frame.write().unwrap();
+                for r in &rects {
+                    if cap.grab(&mut frame, *r)? == Grab::Raced {
+                        raced = true;
+                        break;
+                    }
+                }
             }
-            drop(frame);
-            hub.damage(&rects);
+            if raced {
+                // The screen changed size while we were reading it. Take the
+                // server's word for the new size and redraw from scratch;
+                // what we did read is a mix of two resolutions.
+                let (w, h) = cap.resync_size()?;
+                log::debug(&format!("capture: re-reading at {w}x{h} after a resize"));
+                full = cap.full_rect();
+                hub.resize(w as u32, h as u32, None);
+                stale = true;
+            } else {
+                hub.damage(&rects);
+            }
         }
 
         if cursor_changed {

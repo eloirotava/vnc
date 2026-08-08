@@ -146,77 +146,45 @@ contexto seguro.
 
 ## Copiar e colar
 
-A área de transferência é compartilhada nos dois sentidos: o `rvnc` mantém uma
-janela invisível que assume as seleções `CLIPBOARD` e `PRIMARY` do X quando o
-navegador copia algo, e o XFIXES avisa quando algum programa do desktop copia,
-para repassar ao navegador.
+A área de transferência é compartilhada nos dois sentidos com suporte a **UTF-8 completo** (incluindo acentuação, emojis e caracteres CJK) através do `ExtendedClipboard` do noVNC e seleções do X. O `rvnc` mantém uma janela invisível que assume as seleções `CLIPBOARD` e `PRIMARY` do X quando o navegador copia algo, com suporte a transferências incrementais (`INCR`) para textos extensos.
 
-No navegador isso é automático quando a página tem permissão de clipboard
-(HTTPS ou localhost). Quando o navegador nega, o botão **Clipboard** abre um
-campo de texto que funciona nos dois sentidos.
-
-O RFB transporta texto em Latin-1, então acentos passam normalmente, mas
-caracteres fora dessa faixa (emoji, CJK) viram `?`.
+No navegador isso é automático quando a página tem permissão de clipboard (HTTPS ou localhost). Quando o navegador nega, o botão **Clipboard** abre um painel com contagem de caracteres que funciona nos dois sentidos.
 
 ## Resolução e tela cheia
 
-Por padrão a página está no modo **resize**: o desktop adota o tamanho da
-janela do navegador, então em tela cheia você fica na resolução real do
-monitor, sem escala nem borrão. O botão **Mode** alterna para **scale**, que
-mantém a resolução fixa e apenas ajusta a imagem.
+Por padrão a página está no modo **resize**: o desktop adota o tamanho da janela do navegador, então em tela cheia você fica na resolução real do monitor, sem escala nem borrão. O botão **Mode** alterna para **scale**, que mantém a resolução fixa e apenas ajusta a imagem.
 
-Detalhe do X: um servidor X não cresce além do tamanho com que foi criado.
-Por isso o `rvnc` inicia o `Xvfb` no `--max-geometry` e encolhe para o
-`--geometry`; o teto do que os clientes podem pedir é aquele máximo. Se você
-quer 4K, use `--max-geometry 3840x2160`.
+A barra superior também conta com atalhos rápidos (**Win / Super**, **Alt+Tab**, **Esc**, **Ctrl+C**, **Ctrl+V**, **Ctrl+Alt+Del**), painel de **Stats** (resolução, modo, estado) e acionamento de teclado virtual para telas de toque.
 
 ## Como funciona
 
 Cinco peças, todas dentro do mesmo processo:
 
-1. **Captura** (`src/x11.rs`) — conecta no X como cliente comum, usa XDAMAGE
-   para saber o que mudou e faz `GetImage` só das regiões sujas. Sem damage,
-   cai para varredura de tela cheia. XFIXES fornece a imagem do cursor.
-2. **Entrada** (`src/x11.rs`) — XTEST injeta mouse e teclado. Keysyms que o
-   layout atual não produz são mapeados dinamicamente em keycodes livres, o
-   mesmo truque do `x11vnc`, então acentos e símbolos funcionam.
-3. **Framebuffer compartilhado** (`src/screen.rs`) — a thread de captura
-   escreve num buffer único; cada cliente tem seu próprio bitmap de tiles
-   64x64 sujos, que viram retângulos coalescidos na hora de enviar.
-4. **RFB** (`src/rfb/`) — handshake 3.8, autenticação VNC (DES), tradução de
-   formato de pixel e codificação **ZRLE** (tile sólido, paleta empacotada,
-   paleta RLE ou raw, o que for menor, tudo por cima de um stream zlib por
-   sessão). Raw serve de fallback.
-5. **HTTP/WebSocket** (`src/http.rs`, `src/ws.rs`) — serve o noVNC embutido e
-   faz upgrade de `/websockify` para WebSocket, que carrega o RFB puro.
-6. **Clipboard** (`src/clipboard.rs`) — uma janela própria que assume e lê as
-   seleções do X, ligada ao `ClientCutText`/`ServerCutText` do RFB.
+1. **Captura** (`src/x11.rs`) — conecta no X como cliente comum, usa XDAMAGE para saber o que mudou e faz `GetImage` só das regiões sujas. Sem damage, cai para varredura de tela cheia. XFIXES fornece a imagem do cursor.
+2. **Entrada** (`src/x11.rs`) — XTEST injeta mouse e teclado. Keysyms que o layout atual não produz são mapeados dinamicamente em keycodes livres, o mesmo truque do `x11vnc`, então acentos e símbolos funcionam.
+3. **Framebuffer compartilhado** (`src/screen.rs`) — a thread de captura escreve num buffer único; cada cliente tem seu próprio bitmap de tiles 64x64 sujos, que viram retângulos coalescidos na hora de enviar.
+4. **RFB** (`src/rfb/`) — handshake 3.8, autenticação VNC (DES) com proteção contra força bruta, suporte a `ExtendedClipboard` (UTF-8) e `CopyRect`, tradução de formato de pixel e codificação **ZRLE**.
+5. **HTTP/WebSocket** (`src/http.rs`, `src/ws.rs`) — serve o noVNC embutido e faz upgrade de `/websockify` para WebSocket, que carrega o RFB puro.
+6. **Clipboard** (`src/clipboard.rs`) — uma janela própria que assume e lê as seleções do X com suporte a transferências `INCR`, ligada ao `ClientCutText`/`ServerCutText` do RFB.
 
 ## Segurança
 
 - Sem senha explícita, uma é gerada — o padrão nunca é "aberto".
-- Upgrades de WebSocket com `Origin` de outro host são recusados, para que
-  uma página qualquer não consiga abrir um socket no seu `rvnc`.
-- **Não há TLS.** A autenticação VNC usa DES e é fraca para os padrões de
-  hoje. Para expor na internet, coloque atrás de um proxy reverso com HTTPS
-  ou use um túnel SSH. Em rede local ou dentro de um container, tudo bem.
+- Upgrades de WebSocket com `Origin` de outro host são recusados, para que uma página qualquer não consiga abrir um socket no seu `rvnc`.
+- **Proteção contra força bruta**: tentativas incorretas de autenticação sofrem atraso (backoff) para impedir exploração automatizada de senhas.
+- **Não há TLS.** A autenticação VNC usa DES e é fraca para os padrões de hoje. Para expor na internet, coloque atrás de um proxy reverso com HTTPS ou use um túnel SSH. Em rede local ou dentro de um container, tudo bem.
 
 ## O que ainda não tem
 
-- Clipboard fora do Latin-1 (o `ExtendedClipboard` do noVNC, que faria UTF-8,
-  não está implementado) e transferências INCR, usadas para textos enormes.
 - Resolução acima do `--max-geometry`, por causa do limite do servidor X.
-- Codificações Tight/JPEG e CopyRect. Conteúdo fotográfico em tela cheia cai
-  em ZRLE raw, que comprime pior que JPEG.
+- Codificações Tight/JPEG (conteúdo fotográfico em tela cheia cai em ZRLE raw).
 - Displays com paleta (8 bits). Só true colour de 16, 24 e 32 bits.
-- Conexão de clientes VNC nativos direto na porta: o `rvnc` só escuta
-  HTTP/WebSocket. Para usar um cliente nativo, ponha um `websockify` na
-  frente.
+- Conexão de clientes VNC nativos direto na porta: o `rvnc` só escuta HTTP/WebSocket. Para usar um cliente nativo, ponha um `websockify` na frente.
 
 ## Testes
 
 ```sh
-cargo test                 # 58 testes de unidade
+cargo test                 # 65 testes de unidade
 ```
 
 Para o teste ponta a ponta existe um cliente X de apoio que pinta quadrantes
