@@ -355,6 +355,7 @@ pub fn run_capture(mut cap: Capture, hub: Arc<Hub>, max_fps: u32) -> XResult<()>
     let interval = Duration::from_micros(1_000_000 / max_fps.clamp(1, 120) as u64);
     let idle = Duration::from_millis(250);
     let mut full = cap.full_rect();
+    let mut idle_frames: u32 = 0;
 
     // Prime the framebuffer and the cursor.
     let mut stale = {
@@ -428,6 +429,13 @@ pub fn run_capture(mut cap: Capture, hub: Arc<Hub>, max_fps: u32) -> XResult<()>
             stale = false;
         }
 
+        let had_activity = !rects.is_empty() || cursor_changed || resized.is_some();
+        if had_activity {
+            idle_frames = 0;
+        } else {
+            idle_frames = idle_frames.saturating_add(1);
+        }
+
         if !rects.is_empty() {
             log::debug(&format!("capture: {} rect(s), first {:?}", rects.len(), rects[0]));
             let mut raced = false;
@@ -462,8 +470,17 @@ pub fn run_capture(mut cap: Capture, hub: Arc<Hub>, max_fps: u32) -> XResult<()>
 
         cap.conn.flush()?;
         let elapsed = started.elapsed();
-        if elapsed < interval {
-            std::thread::sleep(interval - elapsed);
+        // Adaptive framing: burst to max_fps on activity, throttle gracefully when idle
+        let target_interval = if idle_frames > 45 {
+            Duration::from_millis(100)
+        } else if idle_frames > 15 {
+            Duration::from_millis(50)
+        } else {
+            interval
+        };
+
+        if elapsed < target_interval {
+            std::thread::sleep(target_interval - elapsed);
         }
     }
 }

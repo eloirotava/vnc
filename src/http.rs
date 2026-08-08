@@ -108,6 +108,9 @@ fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
     if upgrade {
         return upgrade_websocket(stream, reader, req, server);
     }
+    if req.method == "POST" && req.path.starts_with("/upload") {
+        return handle_file_upload(stream, reader, &req);
+    }
     if req.method != "GET" && req.method != "HEAD" {
         return respond(stream, 405, "text/plain", b"method not allowed");
     }
@@ -128,6 +131,52 @@ fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
         return write_response(stream, 200, "text/plain", b"ok\n", req.method != "HEAD");
     }
     serve_static(stream, &req)
+}
+
+fn handle_file_upload<R: BufRead>(stream: TcpStream, mut reader: R, req: &Request) -> io::Result<()> {
+    let content_len: usize = req
+        .header("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if content_len > 500 * 1024 * 1024 {
+        return respond(stream, 413, "text/plain", b"file too large (max 500MB)");
+    }
+
+    let name = req
+        .path
+        .split_once("name=")
+        .map(|(_, n)| n.split('&').next().unwrap_or("file"))
+        .unwrap_or("uploaded_file");
+    let clean_name = name
+        .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_")
+        .trim_start_matches('.')
+        .to_string();
+    let filename = if clean_name.is_empty() { "uploaded_file" } else { &clean_name };
+
+    let base_dir = std::env::var("HOME")
+        .map(|h| format!("{h}/Downloads"))
+        .unwrap_or_else(|_| "/tmp/rvnc-uploads".into());
+    let _ = std::fs::create_dir_all(&base_dir);
+    let dest = format!("{base_dir}/{filename}");
+
+    let mut buf = vec![0u8; content_len.min(64 * 1024)];
+    let mut file = std::fs::File::create(&dest)?;
+    let mut remaining = content_len;
+
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        let n = reader.read(&mut buf[..to_read])?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])?;
+        remaining -= n;
+    }
+    file.flush()?;
+
+    log::info(&format!("uploaded file: {dest} ({content_len} bytes)"));
+    let body = format!("{{\"success\":true,\"name\":\"{filename}\",\"path\":\"{dest}\"}}\n");
+    respond(stream, 200, "application/json", body.as_bytes())
 }
 
 /// Reject cross-origin upgrades: without this, any web page the user visits

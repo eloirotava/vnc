@@ -9,7 +9,7 @@
   :root {
     color-scheme: dark;
     --bg-dark: #0f1115;
-    --card-bg: rgba(26, 29, 36, 0.9);
+    --card-bg: rgba(26, 29, 36, 0.92);
     --border: rgba(255, 255, 255, 0.12);
     --border-hover: rgba(255, 255, 255, 0.25);
     --primary: #2a6df4;
@@ -17,6 +17,7 @@
     --text: #f0f2f5;
     --text-muted: #9aa3b2;
     --danger: #ff5c5c;
+    --success: #10b981;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -36,9 +37,9 @@
     left: 50%;
     transform: translateX(-50%) translateY(-150%);
     display: flex;
-    gap: .4rem;
+    gap: .35rem;
     align-items: center;
-    padding: .4rem .7rem;
+    padding: .35rem .65rem;
     background: var(--card-bg);
     border: 1px solid var(--border);
     border-radius: 12px;
@@ -46,7 +47,7 @@
     backdrop-filter: blur(14px);
     transition: transform .22s cubic-bezier(0.16, 1, 0.3, 1), opacity .2s ease;
     z-index: 50;
-    max-width: 96vw;
+    max-width: 98vw;
     flex-wrap: nowrap;
     overflow-x: auto;
   }
@@ -70,13 +71,13 @@
     display: flex;
     align-items: center;
     gap: .35rem;
-    margin-right: .3rem;
+    margin-right: .2rem;
   }
   .brand svg { width: 15px; height: 15px; fill: var(--primary); }
   #status {
     color: var(--text-muted);
     font-size: .8rem;
-    margin-right: .4rem;
+    margin-right: .3rem;
     white-space: nowrap;
     display: flex;
     align-items: center;
@@ -88,17 +89,17 @@
     border-radius: 50%;
     background: #ffaa00;
   }
-  #status-indicator.online { background: #10b981; box-shadow: 0 0 6px #10b98188; }
+  #status-indicator.online { background: var(--success); box-shadow: 0 0 6px #10b98188; }
   #status-indicator.offline { background: var(--danger); }
 
-  .divider { width: 1px; height: 18px; background: var(--border); margin: 0 .2rem; }
+  .divider { width: 1px; height: 18px; background: var(--border); margin: 0 .15rem; }
 
-  button, .btn, select {
+  button, .btn {
     background: rgba(255, 255, 255, 0.06);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 7px;
-    padding: .28rem .55rem;
+    padding: .25rem .5rem;
     font: inherit;
     font-size: .82rem;
     cursor: pointer;
@@ -106,9 +107,9 @@
     transition: background .12s, border-color .12s, transform .08s;
     display: inline-flex;
     align-items: center;
-    gap: .3rem;
+    gap: .25rem;
   }
-  button:hover, select:hover {
+  button:hover {
     background: rgba(255, 255, 255, 0.12);
     border-color: var(--border-hover);
   }
@@ -119,6 +120,17 @@
     color: #fff;
   }
   button.primary:hover { background: var(--primary-hover); }
+
+  button.recording {
+    background: rgba(255, 92, 92, 0.2);
+    border-color: var(--danger);
+    color: #ff8080;
+    animation: pulseRec 1.2s infinite ease-in-out;
+  }
+  @keyframes pulseRec {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.75; transform: scale(0.98); }
+  }
 
   /* Modals */
   .modal {
@@ -149,7 +161,7 @@
   .modal h1 { margin: 0; font-size: 1.15rem; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
   .modal p { margin: 0; color: var(--text-muted); font-size: .85rem; }
 
-  input, textarea, select {
+  input, textarea {
     background: #101217;
     color: var(--text);
     border: 1px solid var(--border);
@@ -159,7 +171,7 @@
     outline: none;
     transition: border-color .15s, box-shadow .15s;
   }
-  input:focus, textarea:focus, select:focus {
+  input:focus, textarea:focus {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px rgba(42, 109, 244, 0.25);
   }
@@ -169,7 +181,6 @@
   }
   #error { color: var(--danger); font-size: .85rem; min-height: 1.2em; }
 
-  /* Mobile virtual keyboard proxy */
   #key-proxy {
     position: fixed;
     top: -100px;
@@ -200,10 +211,50 @@
     gap: .4rem;
     margin-top: .5rem;
   }
+
+  /* Drag and drop overlay */
+  #drop-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(42, 109, 244, 0.25);
+    border: 3px dashed var(--primary);
+    backdrop-filter: blur(4px);
+    display: none;
+    place-items: center;
+    z-index: 90;
+    color: #fff;
+    font-size: 1.3rem;
+    font-weight: 600;
+    pointer-events: none;
+  }
+
+  /* Toast Notification */
+  #toast {
+    position: fixed;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%) translateY(100px);
+    background: #181b22;
+    border: 1px solid var(--border-hover);
+    color: #fff;
+    padding: .6rem 1rem;
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    font-size: .85rem;
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    transition: transform .25s cubic-bezier(0.16, 1, 0.3, 1);
+    z-index: 120;
+    pointer-events: none;
+  }
+  #toast.show { transform: translateX(-50%) translateY(0); }
 </style>
 </head>
 <body>
 <div id="peek"></div>
+<div id="drop-overlay">Drop files here to upload to Desktop (Downloads)</div>
+<div id="toast"><span id="toast-msg">Notification</span></div>
 
 <div id="bar">
   <div class="brand">
@@ -226,6 +277,7 @@
   <button id="mode" title="Toggle Resize vs Scale">Mode: resize</button>
   <button id="clip" title="Shared Clipboard">Clipboard</button>
   <button id="btn-res" title="Screen Resolution Presets">Display</button>
+  <button id="btn-rec" title="Record Session to WebM Video">⏺ Record</button>
   <button id="btn-stats" title="Connection Statistics">Stats</button>
   <button id="btn-kbd" title="Toggle Mobile Keyboard">Keyboard</button>
   <button id="full" title="Fullscreen">Fullscreen</button>
@@ -290,12 +342,12 @@
         <div id="stat-mode" class="stat-val">Resize</div>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Security / Transport</div>
-        <div id="stat-auth" class="stat-val">WS</div>
+        <div class="stat-label">Transport / Protocol</div>
+        <div id="stat-auth" class="stat-val">WS / RFB 3.8</div>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Encoding</div>
-        <div id="stat-enc" class="stat-val">ZRLE / Raw</div>
+        <div class="stat-label">Encoding Pipeline</div>
+        <div id="stat-enc" class="stat-val">ZRLE / Raw (Adaptive FPS)</div>
       </div>
     </div>
     <div style="display: flex; justify-content: flex-end;">
@@ -331,6 +383,17 @@ const bar = el('bar');
 let rfb = null;
 let mode = params.get('mode') === 'scale' ? 'scale' : 'resize';
 let lastClipboard = '';
+let mediaRecorder = null;
+let recordedChunks = [];
+let recTimer = null;
+let recSecs = 0;
+
+function toast(msg) {
+  const t = el('toast');
+  el('toast-msg').textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3500);
+}
 
 function url() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -447,6 +510,107 @@ el('btn-ctrlc').addEventListener('click', () => {
 
 el('btn-ctrlv').addEventListener('click', () => {
   sendKeyCombo([{ sym: 0xffe3, code: 'ControlLeft' }, { sym: 0x0076, code: 'KeyV' }]);
+});
+
+// In-Browser Screen Recorder (WebM)
+el('btn-rec').addEventListener('click', () => {
+  const btn = el('btn-rec');
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    clearInterval(recTimer);
+    btn.classList.remove('recording');
+    btn.textContent = '⏺ Record';
+    toast('Screen recording saved!');
+    return;
+  }
+
+  const canvas = document.querySelector('#screen canvas');
+  if (!canvas) {
+    toast('No active screen to record.');
+    return;
+  }
+
+  try {
+    const stream = canvas.captureStream(30);
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
+    mediaRecorder = new MediaRecorder(stream, { mimeType: mime });
+    recordedChunks = [];
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) recordedChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(recordedChunks, { type: 'video/webm' });
+      const dlUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      a.href = dlUrl;
+      a.download = `rvnc-recording-${stamp}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(dlUrl); }, 100);
+    };
+
+    mediaRecorder.start(1000);
+    recSecs = 0;
+    btn.classList.add('recording');
+    btn.textContent = '⏹ 00:00';
+    recTimer = setInterval(() => {
+      recSecs++;
+      const m = String(Math.floor(recSecs / 60)).padStart(2, '0');
+      const s = String(recSecs % 60).padStart(2, '0');
+      btn.textContent = `⏹ ${m}:${s}`;
+    }, 1000);
+    toast('Recording session started...');
+  } catch (err) {
+    toast('Recording not supported: ' + err.message);
+  }
+});
+
+// Drag & Drop File Uploads
+const dropOverlay = el('drop-overlay');
+let dragCounter = 0;
+
+window.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+  dragCounter++;
+  dropOverlay.style.display = 'grid';
+});
+window.addEventListener('dragleave', (e) => {
+  e.preventDefault();
+  dragCounter--;
+  if (dragCounter <= 0) {
+    dragCounter = 0;
+    dropOverlay.style.display = 'none';
+  }
+});
+window.addEventListener('dragover', (e) => e.preventDefault());
+
+window.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dragCounter = 0;
+  dropOverlay.style.display = 'none';
+
+  const files = e.dataTransfer.files;
+  if (!files || files.length === 0) return;
+
+  for (const file of files) {
+    toast(`Uploading ${file.name} (${(file.size / 1024).toFixed(1)} KB)...`);
+    try {
+      const res = await fetch(`upload?name=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        body: file,
+      });
+      if (res.ok) {
+        toast(`Uploaded ${file.name} to Downloads folder!`);
+      } else {
+        toast(`Upload failed for ${file.name}`);
+      }
+    } catch (err) {
+      toast(`Upload error: ${err.message}`);
+    }
+  }
 });
 
 // On-screen / mobile keyboard trigger

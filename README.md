@@ -157,17 +157,17 @@ No navegador isso é automático quando a página tem permissão de clipboard (H
 
 Por padrão a página está no modo **resize**: o desktop adota o tamanho da janela do navegador, então em tela cheia você fica na resolução real do monitor, sem escala nem borrão. O botão **Mode** alterna para **scale**, que mantém a resolução fixa e apenas ajusta a imagem.
 
-A barra superior também conta com atalhos rápidos (**Win / Super**, **Alt+Tab**, **Esc**, **Ctrl+C**, **Ctrl+V**, **Ctrl+Alt+Del**), painel de **Stats** (resolução, modo, estado) e acionamento de teclado virtual para telas de toque.
+A barra superior também conta com atalhos rápidos (**Win / Super**, **Alt+Tab**, **Esc**, **Ctrl+C**, **Ctrl+V**, **Ctrl+Alt+Del**), gravação de sessão (**Record** em WebM com 1 clique), transferência de arquivos por **Drag & Drop**, seletor de presets de resolução (**Display**), painel de diagnósticos (**Stats**) e teclado virtual para dispositivos móveis.
 
 ## Como funciona
 
 Cinco peças, todas dentro do mesmo processo:
 
-1. **Captura** (`src/x11.rs`) — conecta no X como cliente comum, usa XDAMAGE para saber o que mudou e faz `GetImage` só das regiões sujas. Sem damage, cai para varredura de tela cheia. XFIXES fornece a imagem do cursor.
+1. **Captura adaptativa** (`src/x11.rs`) — conecta no X como cliente comum, usa XDAMAGE para saber o que mudou e faz `GetImage` só das regiões sujas com FPS adaptativo (reduz consumo quando ocioso e acelera para 60 FPS com movimento). XFIXES fornece a imagem do cursor.
 2. **Entrada** (`src/x11.rs`) — XTEST injeta mouse e teclado. Keysyms que o layout atual não produz são mapeados dinamicamente em keycodes livres, o mesmo truque do `x11vnc`, então acentos e símbolos funcionam.
 3. **Framebuffer compartilhado** (`src/screen.rs`) — a thread de captura escreve num buffer único; cada cliente tem seu próprio bitmap de tiles 64x64 sujos, que viram retângulos coalescidos na hora de enviar.
 4. **RFB** (`src/rfb/`) — handshake 3.8, autenticação VNC (DES) com proteção contra força bruta, suporte a `ExtendedClipboard` (UTF-8) e `CopyRect`, tradução de formato de pixel e codificação **ZRLE**.
-5. **HTTP/WebSocket** (`src/http.rs`, `src/ws.rs`) — serve o noVNC embutido e faz upgrade de `/websockify` para WebSocket, que carrega o RFB puro.
+5. **HTTP/WebSocket & Uploads** (`src/http.rs`, `src/ws.rs`) — serve o noVNC embutido, API de telemetria `/api/stats`, upload de arquivos drag & drop (`/upload`) e upgrade de `/websockify` para WebSocket, além de listener VNC TCP nativo (`--vnc-listen`).
 6. **Clipboard** (`src/clipboard.rs`) — uma janela própria que assume e lê as seleções do X com suporte a transferências `INCR`, ligada ao `ClientCutText`/`ServerCutText` do RFB.
 
 ## Segurança
