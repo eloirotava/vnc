@@ -9,7 +9,7 @@
   :root {
     color-scheme: dark;
     --bg-dark: #0f1115;
-    --card-bg: rgba(26, 29, 36, 0.88);
+    --card-bg: rgba(26, 29, 36, 0.9);
     --border: rgba(255, 255, 255, 0.12);
     --border-hover: rgba(255, 255, 255, 0.25);
     --primary: #2a6df4;
@@ -93,7 +93,7 @@
 
   .divider { width: 1px; height: 18px; background: var(--border); margin: 0 .2rem; }
 
-  button, .btn {
+  button, .btn, select {
     background: rgba(255, 255, 255, 0.06);
     color: var(--text);
     border: 1px solid var(--border);
@@ -108,7 +108,7 @@
     align-items: center;
     gap: .3rem;
   }
-  button:hover {
+  button:hover, select:hover {
     background: rgba(255, 255, 255, 0.12);
     border-color: var(--border-hover);
   }
@@ -149,7 +149,7 @@
   .modal h1 { margin: 0; font-size: 1.15rem; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
   .modal p { margin: 0; color: var(--text-muted); font-size: .85rem; }
 
-  input, textarea {
+  input, textarea, select {
     background: #101217;
     color: var(--text);
     border: 1px solid var(--border);
@@ -159,7 +159,7 @@
     outline: none;
     transition: border-color .15s, box-shadow .15s;
   }
-  input:focus, textarea:focus {
+  input:focus, textarea:focus, select:focus {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px rgba(42, 109, 244, 0.25);
   }
@@ -193,6 +193,13 @@
   }
   .stat-label { color: var(--text-muted); font-size: .75rem; }
   .stat-val { font-weight: 600; font-size: 1rem; color: #fff; margin-top: .15rem; }
+
+  .preset-btn-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .4rem;
+    margin-top: .5rem;
+  }
 </style>
 </head>
 <body>
@@ -218,6 +225,7 @@
 
   <button id="mode" title="Toggle Resize vs Scale">Mode: resize</button>
   <button id="clip" title="Shared Clipboard">Clipboard</button>
+  <button id="btn-res" title="Screen Resolution Presets">Display</button>
   <button id="btn-stats" title="Connection Statistics">Stats</button>
   <button id="btn-kbd" title="Toggle Mobile Keyboard">Keyboard</button>
   <button id="full" title="Fullscreen">Fullscreen</button>
@@ -242,14 +250,36 @@
   </div>
 </div>
 
+<!-- Resolution Modal -->
+<div id="resolution-modal" class="modal">
+  <div>
+    <h1>Desktop Resolution</h1>
+    <p>Select a resolution preset to dynamically resize the remote X display.</p>
+    <div class="preset-btn-group">
+      <button class="res-preset" data-w="1280" data-h="720">720p (1280x720)</button>
+      <button class="res-preset" data-w="1440" data-h="900">900p (1440x900)</button>
+      <button class="res-preset" data-w="1920" data-h="1080">1080p (1920x1080)</button>
+      <button class="res-preset" data-w="2560" data-h="1440">2K (2560x1440)</button>
+      <button class="res-preset" data-w="3840" data-h="2160">4K (3840x2160)</button>
+    </div>
+    <div style="display: flex; justify-content: flex-end; margin-top: .5rem;">
+      <button id="resclose" class="primary">Close</button>
+    </div>
+  </div>
+</div>
+
 <!-- Stats Modal -->
 <div id="stats" class="modal">
   <div>
-    <h1>Connection Stats</h1>
+    <h1>Connection Stats & Diagnostics</h1>
     <div id="stats-panel">
       <div class="stat-box">
-        <div class="stat-label">Status</div>
+        <div class="stat-label">Connection Status</div>
         <div id="stat-state" class="stat-val">Connecting</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Active Clients</div>
+        <div id="stat-clients" class="stat-val">1 active</div>
       </div>
       <div class="stat-box">
         <div class="stat-label">Resolution</div>
@@ -260,8 +290,12 @@
         <div id="stat-mode" class="stat-val">Resize</div>
       </div>
       <div class="stat-box">
-        <div class="stat-label">Security / Auth</div>
-        <div id="stat-auth" class="stat-val">Encrypted WS</div>
+        <div class="stat-label">Security / Transport</div>
+        <div id="stat-auth" class="stat-val">WS</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Encoding</div>
+        <div id="stat-enc" class="stat-val">ZRLE / Raw</div>
       </div>
     </div>
     <div style="display: flex; justify-content: flex-end;">
@@ -311,7 +345,7 @@ function say(text, state = 'warn', sticky = false) {
   if (!sticky) setTimeout(() => bar.classList.remove('show'), 2500);
 }
 
-function updateStats() {
+async function updateStats() {
   if (!rfb) return;
   el('stat-state').textContent = rfb._rfbConnectionState || 'Connected';
   if (rfb._fbWidth && rfb._fbHeight) {
@@ -319,6 +353,14 @@ function updateStats() {
   }
   el('stat-mode').textContent = mode === 'resize' ? 'Dynamic Resize' : 'Scaled to Window';
   el('stat-auth').textContent = location.protocol === 'https:' ? 'WSS (Secure)' : 'WS (Standard)';
+
+  try {
+    const res = await fetch('api/stats');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.clients !== undefined) el('stat-clients').textContent = `${data.clients} connected`;
+    }
+  } catch (_) {}
 }
 
 function connect(password) {
@@ -424,6 +466,24 @@ el('mode').addEventListener('click', () => {
   el('mode').textContent = `Mode: ${mode}`;
   applyMode();
   updateStats();
+});
+
+// Resolution preset controls
+el('btn-res').addEventListener('click', () => {
+  el('resolution-modal').style.display = 'grid';
+});
+el('resclose').addEventListener('click', () => {
+  el('resolution-modal').style.display = 'none';
+});
+document.querySelectorAll('.res-preset').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const w = parseInt(btn.getAttribute('data-w'), 10);
+    const h = parseInt(btn.getAttribute('data-h'), 10);
+    if (rfb && rfb._sock && rfb._supportsSetDesktopSize) {
+      RFB.messages.setDesktopSize(rfb._sock, w, h, rfb._screenID || 0, rfb._screenFlags || 0);
+    }
+    el('resolution-modal').style.display = 'none';
+  });
 });
 
 // Browser -> desktop clipboard

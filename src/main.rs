@@ -33,7 +33,8 @@ starts Xvfb (which must be installed) and runs the command there; with
 --display it attaches to a display you already have and starts nothing.
 
 OPTIONS:
-    -l, --listen ADDR       where to serve, PORT or HOST:PORT [default: 0.0.0.0:6080]
+    -l, --listen ADDR       where to serve web/noVNC, PORT or HOST:PORT [default: 0.0.0.0:6080]
+        --vnc-listen ADDR   where to serve native VNC clients over TCP, PORT or HOST:PORT
     -d, --display NAME      use an existing X display instead of starting Xvfb
     -g, --geometry WxH      starting size of the display [default: 1440x900]
         --max-geometry WxH  largest size clients may resize to; the X server
@@ -57,6 +58,7 @@ If no password is given, rvnc generates one and prints it at startup.
 
 struct Args {
     listen: String,
+    vnc_listen: Option<String>,
     display: Option<String>,
     geometry: (u32, u32),
     max_geometry: Option<(u32, u32)>,
@@ -75,6 +77,7 @@ impl Default for Args {
     fn default() -> Self {
         Args {
             listen: "0.0.0.0:6080".into(),
+            vnc_listen: None,
             display: None,
             geometry: (1440, 900),
             max_geometry: None,
@@ -258,6 +261,50 @@ fn serve(args: &Args, sup: &Arc<Supervisor>) -> Result<(), Fail> {
         cfg,
         extras: rfb::Extras { resizer, clipboard },
     });
+
+    if let Some(vnc_addr) = &args.vnc_listen {
+        let vnc_listener = TcpListener::bind(bind_addr(vnc_addr)?)
+            .map_err(|e| format!("cannot bind native VNC listener {vnc_addr}: {e}"))?;
+        let vnc_local = vnc_listener.local_addr()?;
+        let server_for_vnc = server.clone();
+        std::thread::Builder::new()
+            .name("vnc-listener".into())
+            .spawn(move || {
+                for stream in vnc_listener.incoming() {
+                    let stream = match stream {
+                        Ok(s) => s,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    };
+                    let server = server_for_vnc.clone();
+                    std::thread::spawn(move || {
+                        let _ = stream.set_nodelay(true);
+                        let in_stream = match stream.try_clone() {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+                        let sink = Arc::new(Mutex::new(stream));
+                        if let Err(e) = rfb::serve(
+                            in_stream,
+                            sink,
+                            server.hub.clone(),
+                            server.input.clone(),
+                            server.cfg.clone(),
+                            server.extras.clone(),
+                        ) {
+                            if e.kind() != std::io::ErrorKind::UnexpectedEof
+                                && e.kind() != std::io::ErrorKind::BrokenPipe
+                                && e.kind() != std::io::ErrorKind::ConnectionReset
+                            {
+                                log::warn(&format!("native vnc client error: {e}"));
+                            }
+                        }
+                    });
+                }
+            })?;
+        log::info(&format!("serving native VNC on {}:{}", host, vnc_local.port()));
+    }
+
     http::run(listener, server)?;
     Ok(())
 }
@@ -331,6 +378,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<Option<Args>, Fail>
                 return Ok(None);
             }
             "-l" | "--listen" => out.listen = need(args.next(), "--listen")?,
+            "--vnc-listen" => out.vnc_listen = Some(need(args.next(), "--vnc-listen")?),
             "-d" | "--display" => out.display = Some(need(args.next(), "--display")?),
             "-g" | "--geometry" => out.geometry = parse_geometry(&need(args.next(), "--geometry")?)?,
             "--max-geometry" => {
@@ -465,6 +513,13 @@ mod tests {
             ["--password", "x", "--no-password"].iter().map(|s| s.to_string()),
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn vnc_listen_flag_is_parsed() {
+        let a = parse(&["--vnc-listen", ":5900"]);
+        assert_eq!(a.vnc_listen.as_deref(), Some(":5900"));
+        assert_eq!(parse(&[]).vnc_listen, None);
     }
 
     #[test]

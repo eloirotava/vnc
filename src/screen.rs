@@ -289,6 +289,10 @@ impl Hub {
         *self.client_count.lock().unwrap() > 0
     }
 
+    pub fn client_count(&self) -> usize {
+        *self.client_count.lock().unwrap()
+    }
+
     pub fn register(&self) -> Arc<ClientLink> {
         let (w, h) = self.dimensions();
         let mut dirty = TileMap::new(w, h);

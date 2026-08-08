@@ -65,7 +65,8 @@ rvnc --listen 127.0.0.1:6080 --view-only --display :0
 
 | Opção | O que faz |
 | --- | --- |
-| `-l, --listen ADDR` | `PORTA` ou `HOST:PORTA` (padrão `0.0.0.0:6080`) |
+| `-l, --listen ADDR` | onde servir a interface web/noVNC (`PORTA` ou `HOST:PORTA`, padrão `0.0.0.0:6080`) |
+| `--vnc-listen ADDR` | onde servir clientes VNC nativos via TCP (`PORTA` ou `HOST:PORTA`, ex: `:5900`) |
 | `-d, --display NOME` | usa um X existente em vez de subir um `Xvfb` |
 | `-g, --geometry WxH` | tamanho do display criado (padrão `1440x900`) |
 | `--depth N` | profundidade de cor do display criado (`16`, `24`, `30`) |
@@ -81,6 +82,8 @@ rvnc --listen 127.0.0.1:6080 --view-only --display :0
 
 Sem `--password` nem `--no-password`, o `rvnc` gera uma senha aleatória e a
 imprime no startup.
+
+Com `--vnc-listen :5900`, clientes VNC nativos (TigerVNC, RealVNC, Remmina, Vinagre, apps mobile) podem se conectar diretamente pela porta 5900 com o protocolo RFB 3.8 puro, simultaneamente com o noVNC via web no mesmo display.
 
 ## Build
 

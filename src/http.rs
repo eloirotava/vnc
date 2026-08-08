@@ -111,6 +111,22 @@ fn handle(stream: TcpStream, server: &Server) -> io::Result<()> {
     if req.method != "GET" && req.method != "HEAD" {
         return respond(stream, 405, "text/plain", b"method not allowed");
     }
+    let path = req.path.split(['?', '#']).next().unwrap_or("/");
+    if path == "/api/stats" || path == "/metrics" {
+        let (w, h) = server.hub.dimensions();
+        let clients = server.hub.client_count();
+        let body = format!(
+            "{{\"width\":{},\"height\":{},\"clients\":{},\"auth\":{}}}\n",
+            w,
+            h,
+            clients,
+            server.cfg.password.is_some()
+        );
+        return write_response(stream, 200, "application/json", body.as_bytes(), req.method != "HEAD");
+    }
+    if path == "/healthz" {
+        return write_response(stream, 200, "text/plain", b"ok\n", req.method != "HEAD");
+    }
     serve_static(stream, &req)
 }
 
